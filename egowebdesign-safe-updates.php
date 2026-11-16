@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, but only after a fresh UpdraftPlus backup. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.1.2
+ * Version: 2.2.0
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.1.2';
+	const VERSION        = '2.2.0';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
@@ -78,7 +78,7 @@ final class EgoWebDesign_Safe_Updates {
 		add_action( 'admin_post_msu_save_settings', [ __CLASS__, 'admin_save_settings' ] );
 		add_action( 'admin_post_msu_new_key', [ __CLASS__, 'admin_new_key' ] );
 		add_filter( 'plugin_action_links_' . plugin_basename( __FILE__ ), function ( $links ) {
-			array_unshift( $links, '<a href="' . esc_url( admin_url( 'options-general.php?page=msu-settings' ) ) . '">Settings</a>' );
+			array_unshift( $links, '<a href="' . esc_url( self::page_url() ) . '">Settings</a>' );
 			return $links;
 		} );
 
@@ -108,6 +108,8 @@ final class EgoWebDesign_Safe_Updates {
 		add_action( 'wp_dashboard_setup', [ __CLASS__, 'dashboard_widget' ] );
 		add_action( 'admin_post_msu_check_now', [ __CLASS__, 'admin_check_now' ] );
 		add_action( 'admin_post_msu_restore', [ __CLASS__, 'admin_restore' ] );
+		add_action( 'admin_post_msu_unblock', [ __CLASS__, 'admin_unblock' ] );
+		add_action( 'admin_notices', [ __CLASS__, 'admin_notice' ] );
 
 		add_filter( 'update_plugins_github.com', [ __CLASS__, 'check_own_update' ], 10, 3 );
 		add_filter( 'upgrader_source_selection', [ __CLASS__, 'fix_own_folder' ], 10, 4 );
@@ -733,66 +735,229 @@ final class EgoWebDesign_Safe_Updates {
 		return $res;
 	}
 
-	/* ------------------------------------------------------------------ Settings screen */
+	/* ------------------------------------------------------------------ Admin screens: shared pieces */
 
-	public static function settings_menu() {
-		add_options_page( 'Safe updates', 'Safe updates', 'manage_options', 'msu-settings', [ __CLASS__, 'render_settings' ] );
+	private static function page_url( $tab = '' ) {
+		return admin_url( 'options-general.php?page=msu-settings' . ( $tab ? "&tab=$tab" : '' ) );
 	}
 
-	public static function render_settings() {
-		if ( ! current_user_can( 'manage_options' ) ) {
+	/** "3 h ago" / "in 2 days", with the exact date on hover. */
+	private static function ago( $t ) {
+		if ( ! $t ) {
+			return '—';
+		}
+		$diff = human_time_diff( $t, time() );
+		return '<time datetime="' . esc_attr( gmdate( 'c', $t ) ) . '" title="' . esc_attr( wp_date( 'Y-m-d H:i', $t ) ) . '">' . esc_html( $t > time() ? "in $diff" : "$diff ago" ) . '</time>';
+	}
+
+	/** Name of an item from its key ("plugin:elementor/elementor.php"). */
+	private static function key_name( $key ) {
+		if ( 'core' === $key ) {
+			return 'WordPress';
+		}
+		list( $type, $id ) = array_pad( explode( ':', $key, 2 ), 2, '' );
+		return self::item_name( $type, $id );
+	}
+
+	private static function held() {
+		return array_filter( get_option( 'msu_seen', [] ), function ( $s ) { return time() - $s['time'] < self::HOLD_DAYS * DAY_IN_SECONDS; } );
+	}
+
+	/** One line that sums up the site: [level ok|warning|error, headline]. Worst problem wins. */
+	private static function overall() {
+		$c = get_option( 'msu_last_check', [] );
+		$b = self::last_backup();
+		if ( ! empty( $c['time'] ) && ! $c['ok'] ) {
+			$n = count( $c['failures'] );
+			return [ 'error', $n > 1 ? "$n checks fail" : 'A check fails' ];
+		}
+		if ( ! class_exists( 'UpdraftPlus' ) && ! has_action( 'updraft_backupnow_backup_all' ) ) {
+			return [ 'warning', 'Updates on hold: UpdraftPlus is not active' ];
+		}
+		if ( empty( $c['time'] ) ) {
+			return [ 'warning', 'Page checks have not run yet' ];
+		}
+		if ( time() - $c['time'] > self::STALE_CHECK ) {
+			return [ 'warning', 'Page checks have stopped running' ];
+		}
+		if ( ! $b['time'] ) {
+			return [ 'warning', 'No complete backup yet' ];
+		}
+		return [ 'ok', 'Site OK' ];
+	}
+
+	/** Status headline and the key facts, shared by the dashboard box and the Overview tab. */
+	private static function render_summary() {
+		$c       = get_option( 'msu_last_check', [] );
+		$b       = self::last_backup();
+		$held    = self::held();
+		$blocked = get_option( 'msu_blocked', [] );
+		$next    = wp_next_scheduled( 'msu_check' );
+		list( $level, $headline ) = self::overall();
+
+		echo '<div class="msu-head msu-' . esc_attr( $level ) . '"><span class="msu-dot" aria-hidden="true"></span><strong>' . esc_html( $headline ) . '</strong>';
+		if ( $next ) {
+			echo '<span class="msu-sub">Next check ' . ( $next > time() ? self::ago( $next ) : 'due now' ) . '</span>';
+		}
+		echo '</div><dl class="msu-rows">';
+
+		echo '<dt>Page checks</dt><dd>';
+		if ( empty( $c['time'] ) ) {
+			echo 'Not run yet';
+		} else {
+			$n = count( self::pages() );
+			echo esc_html( $c['ok'] ? ( 1 === $n ? '1 page passes' : "All $n pages pass" ) : 'Problem found' ) . ' · ' . self::ago( $c['time'] );
+			if ( ! empty( $c['failures'] ) ) {
+				echo '<ul class="msu-fails">';
+				foreach ( $c['failures'] as $k => $v ) {
+					echo '<li><strong>' . esc_html( $k ) . '</strong> ' . esc_html( $v ) . '</li>';
+				}
+				echo '</ul>';
+			}
+		}
+		echo '</dd>';
+
+		echo '<dt>Last backup</dt><dd>' . ( $b['time'] ? self::ago( $b['time'] ) . ( $b['ok'] ? '' : ' <span class="msu-warn">incomplete</span>' ) : 'None found' ) . '</dd>';
+
+		if ( $held ) {
+			echo '<dt>On hold</dt><dd><ul class="msu-list">';
+			foreach ( $held as $s ) {
+				echo '<li>' . esc_html( "{$s['name']} {$s['version']}" ) . ' <span class="msu-muted">installs ' . self::ago( $s['time'] + self::HOLD_DAYS * DAY_IN_SECONDS ) . '</span></li>';
+			}
+			echo '</ul></dd>';
+		}
+
+		if ( $blocked ) {
+			echo '<dt>Blocked</dt><dd><ul class="msu-list">';
+			foreach ( $blocked as $key => $version ) {
+				echo '<li>' . esc_html( self::key_name( $key ) . " $version" ) . ' <span class="msu-muted">broke the site</span> ';
+				self::action_button( 'msu_unblock', 'Allow again', [ 'key' => $key ], 'button-link', 'Let ' . self::key_name( $key ) . " $version install automatically again?" );
+				echo '</li>';
+			}
+			echo '</ul></dd>';
+		}
+		echo '</dl>';
+	}
+
+	/** Small POST form with one button, for admin-post.php actions. */
+	private static function action_button( $action, $label, $fields = [], $class = 'button', $confirm = '', $busy = '' ) {
+		echo '<form class="msu-inline" method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '"' . ( $confirm ? ' data-msu-confirm="' . esc_attr( $confirm ) . '"' : '' ) . '>';
+		wp_nonce_field( $action );
+		echo '<input type="hidden" name="action" value="' . esc_attr( $action ) . '">';
+		foreach ( $fields as $name => $value ) {
+			echo '<input type="hidden" name="' . esc_attr( $name ) . '" value="' . esc_attr( $value ) . '">';
+		}
+		echo '<button type="submit" class="' . esc_attr( $class ) . '"' . ( $busy ? ' data-msu-busy="' . esc_attr( $busy ) . '"' : '' ) . '>' . esc_html( $label ) . '</button></form>';
+	}
+
+	private static function render_copies( $copies ) {
+		echo '<table class="msu-table"><tbody>';
+		foreach ( $copies as $key => $copy ) {
+			echo '<tr><td><strong>' . esc_html( $copy['name'] ) . '</strong> ' . esc_html( $copy['version'] ) . '</td><td class="msu-muted">saved ' . self::ago( $copy['time'] ) . '</td><td class="msu-end">';
+			self::action_button( 'msu_restore', 'Put back', [ 'key' => $key ], 'button button-small', "Put back {$copy['name']} {$copy['version']}? The version installed now will be replaced.", 'Putting back…' );
+			echo '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+
+	private static function render_log( $entries ) {
+		echo '<table class="msu-table msu-log"><tbody>';
+		foreach ( $entries as $l ) {
+			echo '<tr><td class="msu-muted msu-when">' . self::ago( $l[0] ) . '</td><td>' . esc_html( $l[1] ) . '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+
+	/** Styles and behaviour for the dashboard box and the settings screen, printed once. */
+	private static function assets() {
+		static $done = false;
+		if ( $done ) {
 			return;
 		}
-		$s   = self::settings();
-		$url = self::report_url();
-		echo '<div class="wrap"><h1>Safe updates</h1>';
-		if ( isset( $_GET['saved'] ) ) {
-			echo '<div class="notice notice-success is-dismissible"><p>Saved.</p></div>';
-		}
-
-		echo '<h2>Update report link</h2><p>Give this private link to the monitoring dashboard. Anyone who has it can see this site\'s WordPress, theme and plugin versions (nothing else, and it can\'t change anything).</p>';
-		echo '<p><input type="text" readonly class="large-text code" onclick="this.select()" value="' . esc_attr( $url ) . '"></p>';
-		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" onsubmit="return confirm(\'The old link will stop working. Continue?\')">';
-		wp_nonce_field( 'msu_new_key' );
-		echo '<input type="hidden" name="action" value="msu_new_key"><button class="button">Make a new link</button></form>';
-		echo '<p>Status link for UptimeRobot: <code>' . esc_html( rest_url( 'egowebdesign/v1/status' ) ) . '</code></p>';
-
-		echo '<hr><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
-		wp_nonce_field( 'msu_save_settings' );
-		echo '<input type="hidden" name="action" value="msu_save_settings"><table class="form-table" role="presentation">';
-		echo '<tr><th scope="row"><label for="msu-email">Alert email</label></th><td><input id="msu-email" name="email" type="email" class="regular-text" value="' . esc_attr( $s['email'] ) . '"></td></tr>';
-		echo '<tr><th scope="row"><label for="msu-label">Name in email subjects</label></th><td><input id="msu-label" name="label" type="text" class="regular-text" value="' . esc_attr( $s['label'] ) . '"></td></tr>';
-		echo '<tr><th scope="row"><label for="msu-pages">Pages to check</label></th><td><textarea id="msu-pages" name="pages" rows="10" class="large-text code">' . esc_textarea( $s['pages'] ) . '</textarea><p class="description">One page per line: <code>Name | /path/ | text the page must contain, more text</code>. The last part is optional.</p></td></tr>';
-		echo '<tr><th scope="row"><label for="msu-markers">Every page must contain</label></th><td><textarea id="msu-markers" name="markers" rows="5" class="large-text code">' . esc_textarea( $s['markers'] ) . '</textarea><p class="description">One per line: <code>text in the page\'s code | message when it\'s missing</code>. For an Elementor site with a theme-builder header and footer, add <code>elementor-location-header | header missing</code> and <code>elementor-location-footer | footer missing</code>.</p></td></tr>';
-		echo '</table>';
-		submit_button( 'Save' );
-		echo '</form></div>';
+		$done = true;
+		?>
+<style>
+.msu-head{display:flex;align-items:center;gap:8px;margin:0 0 14px}
+.msu-head strong{font-size:14px}
+.msu-dot{flex:none;width:10px;height:10px;border-radius:50%;background:#00a32a;box-shadow:0 0 0 3px #edfaef}
+.msu-warning .msu-dot{background:#dba617;box-shadow:0 0 0 3px #fcf9e8}
+.msu-error .msu-dot{background:#d63638;box-shadow:0 0 0 3px #fcf0f1}
+.msu-sub{margin-left:auto;color:#646970;font-size:12px}
+.msu-rows{display:grid;grid-template-columns:max-content 1fr;gap:8px 20px;margin:0}
+.msu-rows dt{color:#646970}
+.msu-rows dd{margin:0}
+.msu-list,.msu-fails{margin:0}
+.msu-list li,.msu-fails li{margin:0 0 4px}
+.msu-fails{margin-top:6px;padding:8px 10px;border-left:3px solid #d63638;background:#fcf0f1}
+.msu-fails strong{margin-right:4px}
+.msu-muted{color:#646970}
+.msu-version{color:#646970;font-size:13px;font-weight:400}
+.msu-warn{color:#996800}
+.msu-inline{display:inline}
+.msu-inline .button-link{vertical-align:baseline}
+.msu-actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin:16px -12px 0;padding:12px 12px 0;border-top:1px solid #f0f0f1}
+.msu-actions a{margin-left:auto;text-decoration:none}
+.msu-more{margin:12px -12px 0;border-top:1px solid #f0f0f1}
+.msu-more summary{padding:10px 12px 0;cursor:pointer;font-weight:600}
+.msu-more[open] summary{padding-bottom:6px}
+.msu-more > :not(summary){margin:0 12px}
+.msu-table{width:100%;border-collapse:collapse}
+.msu-table td{padding:6px 8px 6px 0;border-top:1px solid #f0f0f1;vertical-align:top}
+.msu-table tr:first-child td{border-top:0}
+.msu-end{text-align:right;white-space:nowrap}
+.msu-when{width:1%;white-space:nowrap}
+.msu-wrap{max-width:860px}
+.msu-wrap .card{max-width:none;margin:16px 0 0;padding:16px 20px}
+.msu-wrap .card h2{margin:0 0 4px;font-size:14px}
+.msu-wrap .card > p.description{margin:0 0 14px}
+.msu-wrap .msu-actions,.msu-wrap .msu-more{margin-left:-20px;margin-right:-20px;padding-left:20px;padding-right:20px}
+.msu-wrap .msu-more summary{padding-left:0}
+.msu-wrap .msu-more > :not(summary){margin:0}
+.msu-rows-edit td{padding:4px 8px 4px 0;vertical-align:middle}
+.msu-rows-edit th{padding:0 8px 6px 0;text-align:left;font-weight:600}
+.msu-rows-edit input{width:100%}
+.msu-rows-edit .msu-x{width:1%}
+.msu-field{display:flex;gap:8px;align-items:center}
+.msu-field input{flex:1;min-width:0}
+.msu-form-actions{display:flex;gap:8px;margin-top:10px}
+@media (max-width:600px){.msu-sub{display:none}.msu-rows{grid-template-columns:1fr;gap:2px}.msu-rows dd{margin-bottom:8px}}
+</style>
+<script>
+document.addEventListener('submit', function (e) {
+	var f = e.target, msg = f.getAttribute('data-msu-confirm');
+	if (msg && !window.confirm(msg)) { e.preventDefault(); return; }
+	var b = f.querySelector('[data-msu-busy]');
+	if (b) { setTimeout(function () { b.disabled = true; b.textContent = b.getAttribute('data-msu-busy'); }); }
+});
+document.addEventListener('click', function (e) {
+	var t = e.target.closest('[data-msu-copy],[data-msu-add],.msu-x button');
+	if (!t) { return; }
+	if (t.hasAttribute('data-msu-copy')) {
+		var input = document.getElementById(t.getAttribute('data-msu-copy')), label = t.textContent;
+		input.select();
+		(navigator.clipboard ? navigator.clipboard.writeText(input.value) : Promise.resolve(document.execCommand('copy'))).then(function () {
+			t.textContent = 'Copied';
+			setTimeout(function () { t.textContent = label; }, 1500);
+		});
+		return;
 	}
-
-	public static function admin_save_settings() {
-		check_admin_referer( 'msu_save_settings' );
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( 'Not allowed.' );
-		}
-		$in = wp_unslash( $_POST );
-		update_option( 'msu_settings', [
-			'email'   => sanitize_email( $in['email'] ?? '' ) ?: self::DEFAULT_EMAIL,
-			'label'   => sanitize_text_field( $in['label'] ?? '' ),
-			'pages'   => trim( str_replace( "\r", '', (string) ( $in['pages'] ?? '' ) ) ), // Markers are bits of HTML, kept as typed.
-			'markers' => trim( str_replace( "\r", '', (string) ( $in['markers'] ?? '' ) ) ), // Markers are bits of HTML, kept as typed.
-		], false );
-		wp_safe_redirect( admin_url( 'options-general.php?page=msu-settings&saved=1' ) );
-		exit;
+	if (t.hasAttribute('data-msu-add')) {
+		var body = document.getElementById(t.getAttribute('data-msu-add')), rows = JSON.parse(t.getAttribute('data-msu-rows') || '[[]]');
+		rows.forEach(function (values) {
+			var row = document.getElementById(body.id + '-tpl').content.firstElementChild.cloneNode(true);
+			row.querySelectorAll('input').forEach(function (input, i) { input.value = values[i] || ''; });
+			body.appendChild(row);
+			if (!values.length) { row.querySelector('input').focus(); }
+		});
+		if (t.hasAttribute('data-msu-rows')) { t.remove(); }
+		return;
 	}
-
-	public static function admin_new_key() {
-		check_admin_referer( 'msu_new_key' );
-		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_die( 'Not allowed.' );
-		}
-		update_option( 'msu_report_key', wp_generate_password( 32, false ), false );
-		wp_safe_redirect( admin_url( 'options-general.php?page=msu-settings&saved=1' ) );
-		exit;
+	var tr = t.closest('tr'), tbody = tr.parentNode;
+	tr.remove();
+	if (!tbody.children.length) { document.querySelector('[data-msu-add="' + tbody.id + '"]').click(); }
+});
+</script>
+		<?php
 	}
 
 	/* ------------------------------------------------------------------ Dashboard box */
@@ -804,58 +969,229 @@ final class EgoWebDesign_Safe_Updates {
 	}
 
 	public static function render_widget() {
-		$c      = get_option( 'msu_last_check', [] );
-		$b      = self::last_backup();
-		$seen   = get_option( 'msu_seen', [] );
 		$copies = get_option( 'msu_copies', [] );
-		$log    = array_slice( array_reverse( get_option( 'msu_log', [] ) ), 0, 8 );
-		$fmt    = function ( $t ) { return $t ? wp_date( 'Y-m-d H:i', $t ) : '—'; };
+		$log    = array_slice( array_reverse( get_option( 'msu_log', [] ) ), 0, 5 );
+		self::assets();
+		self::render_summary();
 
-		echo '<p><strong>Page checks:</strong> ';
-		if ( empty( $c['time'] ) ) {
-			echo 'not run yet';
-		} else {
-			echo $c['ok'] ? '<span style="color:#008a20">✔ all pass</span>' : '<span style="color:#d63638">✖ problem</span>';
-			echo ' (' . esc_html( $fmt( $c['time'] ) ) . ')';
-			foreach ( $c['failures'] ?? [] as $k => $v ) {
-				echo '<br>&nbsp;&nbsp;' . esc_html( "$k: $v" );
-			}
-		}
-		echo '</p><p><strong>Last complete backup:</strong> ' . esc_html( $fmt( $b['time'] ) ) . ( $b['time'] && ! $b['ok'] ? ' (incomplete)' : '' ) . '</p>';
-
-		$held = array_filter( $seen, function ( $s ) { return time() - $s['time'] < self::HOLD_DAYS * DAY_IN_SECONDS; } );
-		if ( $held ) {
-			echo '<p><strong>Big releases waiting:</strong>';
-			foreach ( $held as $s ) {
-				echo '<br>&nbsp;&nbsp;' . esc_html( "{$s['name']} {$s['version']} — from " . $fmt( $s['time'] + self::HOLD_DAYS * DAY_IN_SECONDS ) );
-			}
-			echo '</p>';
-		}
-
+		echo '<div class="msu-actions">';
+		self::action_button( 'msu_check_now', 'Run checks now', [], 'button', '', 'Checking…' );
 		if ( current_user_can( 'manage_options' ) ) {
-			echo '<p><a href="' . esc_url( admin_url( 'options-general.php?page=msu-settings' ) ) . '">Settings and update report link</a></p>';
+			echo '<a href="' . esc_url( self::page_url() ) . '">Details and settings →</a>';
 		}
-		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="margin:8px 0">';
-		wp_nonce_field( 'msu_check_now' );
-		echo '<input type="hidden" name="action" value="msu_check_now"><button class="button">Run page checks now</button></form>';
+		echo '</div>';
 
 		if ( $copies ) {
-			echo '<p><strong>Saved previous versions:</strong></p>';
-			foreach ( $copies as $key => $copy ) {
-				echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="margin:0 0 6px" onsubmit="return confirm(\'Put back this version?\')">';
-				wp_nonce_field( 'msu_restore' );
-				echo '<input type="hidden" name="action" value="msu_restore"><input type="hidden" name="key" value="' . esc_attr( $key ) . '">';
-				echo esc_html( "{$copy['name']} {$copy['version']} (" . $fmt( $copy['time'] ) . ') ' ) . '<button class="button button-small">Put back</button></form>';
-			}
+			echo '<details class="msu-more"><summary>Previous versions (' . count( $copies ) . ')</summary>';
+			self::render_copies( $copies );
+			echo '</details>';
 		}
-
 		if ( $log ) {
-			echo '<p><strong>Recent activity:</strong></p><ul style="margin-top:0">';
-			foreach ( $log as $l ) {
-				echo '<li>' . esc_html( $fmt( $l[0] ) . ' — ' . $l[1] ) . '</li>';
-			}
-			echo '</ul>';
+			echo '<details class="msu-more"><summary>Recent activity</summary>';
+			self::render_log( $log );
+			echo '</details>';
 		}
+	}
+
+	/* ------------------------------------------------------------------ Settings screen */
+
+	public static function settings_menu() {
+		add_options_page( 'Safe updates', 'Safe updates', 'manage_options', 'msu-settings', [ __CLASS__, 'render_settings' ] );
+	}
+
+	public static function render_settings() {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+		$tabs = [ 'overview' => 'Overview', 'settings' => 'Settings', 'monitoring' => 'Monitoring' ];
+		$tab  = sanitize_key( $_GET['tab'] ?? '' );
+		$tab  = isset( $tabs[ $tab ] ) ? $tab : 'overview';
+		self::assets();
+
+		echo '<div class="wrap msu-wrap"><h1>Safe updates <span class="msu-version">v' . esc_html( self::VERSION ) . '</span></h1>';
+		echo '<nav class="nav-tab-wrapper">';
+		foreach ( $tabs as $id => $label ) {
+			echo '<a href="' . esc_url( self::page_url( 'overview' === $id ? '' : $id ) ) . '" class="nav-tab' . ( $id === $tab ? ' nav-tab-active' : '' ) . '"' . ( $id === $tab ? ' aria-current="page"' : '' ) . '>' . esc_html( $label ) . '</a>';
+		}
+		echo '</nav>';
+		call_user_func( [ __CLASS__, "render_tab_$tab" ] );
+		echo '</div>';
+	}
+
+	public static function render_tab_overview() {
+		$copies = get_option( 'msu_copies', [] );
+		$log    = array_reverse( get_option( 'msu_log', [] ) );
+
+		echo '<div class="card">';
+		self::render_summary();
+		echo '<div class="msu-actions">';
+		self::action_button( 'msu_check_now', 'Run checks now', [], 'button', '', 'Checking…' );
+		echo '<span class="msu-muted">Updates install only after a backup from the last ' . esc_html( self::BACKUP_MAX_AGE / HOUR_IN_SECONDS ) . ' h. Big releases wait ' . esc_html( self::HOLD_DAYS ) . ' days.</span></div></div>';
+
+		echo '<div class="card"><h2>Previous versions</h2><p class="description">A copy of each plugin and theme is kept just before it updates. If an update breaks the site, it is put back automatically.</p>';
+		if ( $copies ) {
+			self::render_copies( $copies );
+		} else {
+			echo '<p class="msu-muted">No copies yet. One is saved at the next update.</p>';
+		}
+		echo '</div>';
+
+		echo '<div class="card"><h2>Activity</h2><p class="description">The last ' . count( $log ) . ' events.</p>';
+		if ( $log ) {
+			self::render_log( $log );
+		} else {
+			echo '<p class="msu-muted">Nothing yet.</p>';
+		}
+		echo '</div>';
+	}
+
+	/** Editable rows for a "a | b | c" setting. $cols = [label => placeholder]. */
+	private static function render_rows_editor( $id, $name, $cols, $rows, $add_label ) {
+		$cell = function ( $values ) use ( $name, $cols ) {
+			$html = '<tr>';
+			$i    = 0;
+			foreach ( $cols as $label => $placeholder ) {
+				$html .= '<td><input type="text" class="code" name="' . esc_attr( $name ) . '[' . $i . '][]" value="' . esc_attr( $values[ $i ] ?? '' ) . '" placeholder="' . esc_attr( $placeholder ) . '" aria-label="' . esc_attr( $label ) . '"></td>';
+				$i++;
+			}
+			return $html . '<td class="msu-x"><button type="button" class="button-link button-link-delete">Remove</button></td></tr>';
+		};
+		echo '<table class="msu-table msu-rows-edit"><thead><tr>';
+		foreach ( array_keys( $cols ) as $label ) {
+			echo '<th scope="col">' . esc_html( $label ) . '</th>';
+		}
+		echo '<th></th></tr></thead><tbody id="' . esc_attr( $id ) . '">';
+		foreach ( $rows ?: [ [] ] as $values ) {
+			echo $cell( $values ); // phpcs:ignore WordPress.Security.EscapeOutput -- escaped in $cell.
+		}
+		echo '</tbody></table><template id="' . esc_attr( $id ) . '-tpl">' . $cell( [] ) . '</template>'; // phpcs:ignore WordPress.Security.EscapeOutput
+		echo '<button type="button" class="button button-small" data-msu-add="' . esc_attr( $id ) . '" style="margin-top:8px">' . esc_html( $add_label ) . '</button>';
+	}
+
+	/** "a | b | c" lines => [[a, b, c], …]. */
+	private static function split_lines( $text, $limit ) {
+		$rows = [];
+		foreach ( preg_split( '/\R/', $text ) as $line ) {
+			if ( '' !== trim( $line ) ) {
+				$rows[] = array_map( 'trim', explode( '|', $line, $limit ) );
+			}
+		}
+		return $rows;
+	}
+
+	public static function render_tab_settings() {
+		$s       = self::settings();
+		$markers = self::split_lines( $s['markers'], 2 );
+		$has     = implode( ' ', array_column( $markers, 0 ) );
+
+		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+		wp_nonce_field( 'msu_save_settings' );
+		echo '<input type="hidden" name="action" value="msu_save_settings">';
+
+		echo '<div class="card"><h2>Pages to check</h2><p class="description">Loaded after every update and twice a day. A page fails if it does not answer, shows a PHP error, or is missing the text you list (separate several with commas).</p>';
+		self::render_rows_editor( 'msu-pages', 'pages', [ 'Name' => 'Contact', 'Path' => '/contact/', 'Must contain (optional)' => 'wpforms-form' ], self::split_lines( $s['pages'], 3 ), 'Add page' );
+		echo '</div>';
+
+		echo '<div class="card"><h2>Every page must contain</h2><p class="description">Bits of the page\'s HTML code. When one is missing, the page fails with your message.</p>';
+		self::render_rows_editor( 'msu-markers', 'markers', [ 'Text in the HTML' => '</html>', 'Message when missing' => 'page is cut off' ], $markers, 'Add text' );
+		if ( defined( 'ELEMENTOR_PRO_VERSION' ) && false === strpos( $has, 'elementor-location-header' ) ) {
+			echo ' <button type="button" class="button button-small" data-msu-add="msu-markers" data-msu-rows="' . esc_attr( wp_json_encode( [ [ 'elementor-location-header', 'header missing' ], [ 'elementor-location-footer', 'footer missing' ] ] ) ) . '" style="margin-top:8px">Add Elementor header and footer</button>';
+		}
+		echo '</div>';
+
+		echo '<div class="card"><h2>Alerts</h2><table class="form-table" role="presentation">';
+		echo '<tr><th scope="row"><label for="msu-email">Send alerts to</label></th><td><input id="msu-email" name="email" type="email" class="regular-text" value="' . esc_attr( $s['email'] ) . '"></td></tr>';
+		echo '<tr><th scope="row"><label for="msu-label">Site name in subjects</label></th><td><input id="msu-label" name="label" type="text" class="regular-text" value="' . esc_attr( $s['label'] ) . '"><p class="description">Subjects look like <code>[' . esc_html( $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST ) ) . '] Problem detected on the website</code></p></td></tr>';
+		echo '</table></div>';
+
+		echo '<div class="msu-form-actions">';
+		submit_button( 'Save changes', 'primary', 'submit', false );
+		echo '</div></form>';
+	}
+
+	public static function render_tab_monitoring() {
+		echo '<div class="card"><h2>Update report link</h2><p class="description">For the EgoWebDesign monitoring dashboard. Anyone with this link can see the WordPress, theme and plugin versions of this site, nothing else, and it changes nothing.</p>';
+		echo '<div class="msu-field"><input id="msu-report" type="text" readonly class="code" value="' . esc_attr( self::report_url() ) . '"><button type="button" class="button" data-msu-copy="msu-report">Copy</button></div>';
+		echo '<div class="msu-actions">';
+		self::action_button( 'msu_new_key', 'Make a new link', [], 'button-link button-link-delete', 'The current link will stop working right away. Continue?' );
+		echo '<span class="msu-muted">Use this if the link was shared by mistake.</span></div></div>';
+
+		echo '<div class="card"><h2>Status link</h2><p class="description">For UptimeRobot. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running.</p>';
+		echo '<div class="msu-field"><input id="msu-status" type="text" readonly class="code" value="' . esc_attr( rest_url( 'egowebdesign/v1/status' ) ) . '"><button type="button" class="button" data-msu-copy="msu-status">Copy</button></div></div>';
+	}
+
+	/* ------------------------------------------------------------------ Admin actions */
+
+	/** Back to the screen the action came from, with a message. */
+	private static function back( $notice, $item = '' ) {
+		$to = remove_query_arg( [ 'msu_notice', 'msu_item' ], wp_get_referer() ?: admin_url() );
+		wp_safe_redirect( add_query_arg( array_filter( [ 'msu_notice' => $notice, 'msu_item' => rawurlencode( $item ) ] ), $to ) );
+		exit;
+	}
+
+	public static function admin_notice() {
+		if ( empty( $_GET['msu_notice'] ) || ! current_user_can( 'update_plugins' ) ) {
+			return;
+		}
+		$item     = sanitize_text_field( wp_unslash( $_GET['msu_item'] ?? '' ) );
+		$messages = [
+			'saved'     => [ 'success', 'Settings saved.' ],
+			'new-key'   => [ 'success', 'New report link made. Update it in the monitoring dashboard.' ],
+			'checks-ok' => [ 'success', 'Page checks pass.' ],
+			'checks-ko' => [ 'error', 'Page checks found a problem. Details are in the Safe updates box.' ],
+			'restored'  => [ 'success', "$item is back. Page checks pass." ],
+			'restored-ko' => [ 'warning', "$item is back, but page checks still fail." ],
+			'restore-failed' => [ 'error', "Could not put the previous version back: $item" ],
+			'unblocked' => [ 'success', "$item can update automatically again." ],
+		];
+		$code = sanitize_key( $_GET['msu_notice'] );
+		if ( isset( $messages[ $code ] ) ) {
+			echo '<div class="notice notice-' . esc_attr( $messages[ $code ][0] ) . ' is-dismissible"><p>' . esc_html( $messages[ $code ][1] ) . '</p></div>';
+		}
+	}
+
+	public static function admin_save_settings() {
+		check_admin_referer( 'msu_save_settings' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$in = wp_unslash( $_POST );
+		// Rows from the editor => "a | b | c" lines. Markers are bits of HTML, kept as typed.
+		$lines = function ( $cols, $required, $clean = null ) {
+			$out  = [];
+			$cols = (array) $cols;
+			ksort( $cols );
+			foreach ( $cols[ $required ] ?? [] as $i => $value ) {
+				$row = [];
+				foreach ( $cols as $c => $values ) {
+					$row[ $c ] = trim( str_replace( [ "\r", "\n", '|' ], ' ', (string) ( $values[ $i ] ?? '' ) ) );
+				}
+				if ( '' === $row[ $required ] ) {
+					continue;
+				}
+				$out[] = rtrim( implode( ' | ', $clean ? $clean( $row ) : $row ), ' |' );
+			}
+			return implode( "\n", $out );
+		};
+		update_option( 'msu_settings', [
+			'email'   => sanitize_email( $in['email'] ?? '' ) ?: self::DEFAULT_EMAIL,
+			'label'   => sanitize_text_field( $in['label'] ?? '' ),
+			'pages'   => $lines( $in['pages'] ?? [], 1, function ( $row ) {
+				$row[1] = '/' . ltrim( preg_replace( '#^https?://[^/]+#', '', $row[1] ), '/' );
+				return $row;
+			} ),
+			'markers' => $lines( $in['markers'] ?? [], 0 ),
+		], false );
+		self::back( 'saved' );
+	}
+
+	public static function admin_new_key() {
+		check_admin_referer( 'msu_new_key' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		update_option( 'msu_report_key', wp_generate_password( 32, false ), false );
+		self::back( 'new-key' );
 	}
 
 	public static function admin_check_now() {
@@ -863,9 +1199,7 @@ final class EgoWebDesign_Safe_Updates {
 		if ( ! current_user_can( 'update_plugins' ) ) {
 			wp_die( 'Not allowed.' );
 		}
-		self::run_checks();
-		wp_safe_redirect( admin_url( '#msu_widget' ) );
-		exit;
+		self::back( self::run_checks()['ok'] ? 'checks-ok' : 'checks-ko' );
 	}
 
 	public static function admin_restore() {
@@ -873,13 +1207,28 @@ final class EgoWebDesign_Safe_Updates {
 		if ( ! current_user_can( 'update_plugins' ) ) {
 			wp_die( 'Not allowed.' );
 		}
-		$res = self::restore_copy( sanitize_text_field( wp_unslash( $_POST['key'] ?? '' ) ) );
+		$key    = sanitize_text_field( wp_unslash( $_POST['key'] ?? '' ) );
+		$copies = get_option( 'msu_copies', [] );
+		$name   = isset( $copies[ $key ] ) ? "{$copies[ $key ]['name']} {$copies[ $key ]['version']}" : $key;
+		$res    = self::restore_copy( $key );
 		if ( is_wp_error( $res ) ) {
-			wp_die( esc_html( $res->get_error_message() ) );
+			self::back( 'restore-failed', $res->get_error_message() );
 		}
-		self::run_checks();
-		wp_safe_redirect( admin_url( '#msu_widget' ) );
-		exit;
+		self::back( self::run_checks()['ok'] ? 'restored' : 'restored-ko', $name );
+	}
+
+	public static function admin_unblock() {
+		check_admin_referer( 'msu_unblock' );
+		if ( ! current_user_can( 'update_plugins' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$key     = sanitize_text_field( wp_unslash( $_POST['key'] ?? '' ) );
+		$blocked = get_option( 'msu_blocked', [] );
+		$name    = self::key_name( $key ) . ' ' . ( $blocked[ $key ] ?? '' );
+		unset( $blocked[ $key ] );
+		update_option( 'msu_blocked', $blocked, false );
+		self::log( "$name allowed to update automatically again." );
+		self::back( 'unblocked', $name );
 	}
 
 	/* ------------------------------------------------------------------ Log and email */
