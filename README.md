@@ -12,4 +12,4 @@ Download the zip of the [latest tag](../../tags), upload it in **Plugins > Add N
 ./release.sh 2.1.1
 ```
 
-This sets the version in the plugin, commits, tags `v2.1.1` and pushes. Every site sees the update within about an hour of its next update check, and installs it after a fresh backup.
+This sets the version in the plugin, commits, tags `v2.1.1` and pushes. Sites see it at their next update check (twice a day, or right away with "Check again" in Dashboard > Updates), and installs it after a fresh backup.

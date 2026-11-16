@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, but only after a fresh UpdraftPlus backup. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.1.1
+ * Version: 2.1.2
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.1.1';
+	const VERSION        = '2.1.2';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
@@ -115,16 +115,25 @@ final class EgoWebDesign_Safe_Updates {
 
 	/* ------------------------------------------------------------------ Updates of this plugin (GitHub) */
 
-	/** Newest version on GitHub (the Version line on the main branch), asked at most once an hour. WordPress compares it. */
+	/**
+	 * Newest version on GitHub (highest "vX.Y.Z" tag), asked at most once an hour. WordPress compares it.
+	 * Uses the API: raw.githubusercontent.com can keep serving an old copy for a while after a release.
+	 */
 	public static function check_own_update( $update, $data, $file ) {
 		if ( plugin_basename( __FILE__ ) !== $file ) {
 			return $update;
 		}
 		$version = get_site_transient( 'msu_latest' );
 		if ( false === $version ) {
-			$res     = wp_remote_get( 'https://raw.githubusercontent.com/' . self::REPO . '/main/egowebdesign-safe-updates.php', [ 'timeout' => 10 ] );
-			$body    = is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ? '' : wp_remote_retrieve_body( $res );
-			$version = preg_match( '/^\s*\*\s*Version:\s*(\S+)/m', $body, $m ) ? $m[1] : '';
+			$res     = wp_remote_get( 'https://api.github.com/repos/' . self::REPO . '/tags?per_page=100', [ 'timeout' => 10 ] );
+			$tags    = is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ? [] : json_decode( wp_remote_retrieve_body( $res ), true );
+			$version = '';
+			foreach ( (array) $tags as $tag ) {
+				$v = ltrim( $tag['name'] ?? '', 'v' );
+				if ( preg_match( '/^\d+(\.\d+)+$/', $v ) && ( '' === $version || version_compare( $v, $version, '>' ) ) ) {
+					$version = $v;
+				}
+			}
 			set_site_transient( 'msu_latest', $version, HOUR_IN_SECONDS );
 		}
 		if ( '' === $version ) {
