@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Watches for signs of intrusion: new administrators, changed core files, unexpected PHP files. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.5.0
+ * Version: 2.6.0
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.5.0';
+	const VERSION        = '2.6.0';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
@@ -51,6 +51,9 @@ final class EgoWebDesign_Safe_Updates {
 		delete_option( 'msu_backup_requested' );
 		update_option( 'msu_version', self::VERSION, false );
 		self::schedule_register(); // Installed or updated: sign up / refresh the details in a minute, in the background.
+		if ( false === get_option( 'msu_settings' ) && ! wp_next_scheduled( 'msu_autoconfig' ) ) {
+			wp_schedule_single_event( time() + 2 * MINUTE_IN_SECONDS, 'msu_autoconfig' ); // Never configured: suggest checks from the site.
+		}
 	}
 
 	/* ------------------------------------------------------------------ Monitoring sign-up */
@@ -146,9 +149,15 @@ final class EgoWebDesign_Safe_Updates {
 
 		add_action( 'msu_check', [ __CLASS__, 'scheduled_check' ] );
 		add_action( 'msu_register', [ __CLASS__, 'register_site' ] );
+		add_action( 'msu_weekly', [ __CLASS__, 'weekly_summary' ] );
+		add_action( 'msu_autoconfig', [ __CLASS__, 'auto_configure' ] );
+		add_action( 'admin_post_msu_suggest', [ __CLASS__, 'admin_suggest' ] );
 		add_action( 'init', function () {
 			if ( ! wp_next_scheduled( 'msu_check' ) ) {
 				wp_schedule_event( time() + HOUR_IN_SECONDS, 'twicedaily', 'msu_check' );
+			}
+			if ( ! wp_next_scheduled( 'msu_weekly' ) ) {
+				wp_schedule_event( ( new DateTime( 'next monday 08:00', wp_timezone() ) )->getTimestamp(), 'weekly', 'msu_weekly' );
 			}
 		} );
 
@@ -342,7 +351,14 @@ final class EgoWebDesign_Safe_Updates {
 		if ( is_wp_error( $res ) ) {
 			self::$snapshot_failed = true;
 			self::log( "Update waiting ($reason): the database snapshot failed: " . $res->get_error_message() );
-			self::alert_once( 'snapshot-failing', 'Updates are on hold: the database snapshot failed', "Safe updates only install updates after saving a copy of the database, and that failed:\n\n" . $res->get_error_message() . "\n\nUpdates will be tried again on WordPress's next update round (about 12 h)." );
+			self::alert_once( 'snapshot-failing', 'Updates are on hold: the database snapshot failed', [
+				'tone'   => 'amber',
+				'badge'  => 'On hold',
+				'title'  => 'Updates are on hold',
+				'lead'   => 'Safe updates saves a copy of the database before installing updates, and that failed. Updates will be tried again on WordPress\'s next update round (about 12 h).',
+				'facts'  => [ [ 'Waiting', $reason ], [ 'Why', $res->get_error_message() ] ],
+				'button' => [ 'Open Safe updates', self::page_url() ],
+			] );
 			return false;
 		}
 		return true;
@@ -619,7 +635,7 @@ final class EgoWebDesign_Safe_Updates {
 
 		$check = self::run_checks();
 		if ( $check['ok'] ) {
-			self::mail( 'Updates installed, site checked OK', "These updates were installed automatically after a database snapshot:\n\n$list\n\nAll page checks passed." );
+			self::remember_for_week( $updated ); // Good news waits for the weekly summary.
 			return;
 		}
 
@@ -649,20 +665,40 @@ final class EgoWebDesign_Safe_Updates {
 			$blocked                     = get_option( 'msu_blocked', [] );
 			$blocked[ $culprit['key'] ] = $culprit['to'];
 			update_option( 'msu_blocked', $blocked, false );
-			$back = implode( "\n", array_map( function ( $u ) { return "- {$u['name']} back to {$u['from']}"; }, $restored ) );
-			self::mail(
-				"Update undone: {$culprit['name']} {$culprit['to']} broke the site",
-				"These updates were installed automatically:\n\n$list\n\nAfter the update, the page checks failed. The previous version was put back and the site passes the checks again:\n\n$back\n\n{$culprit['name']} {$culprit['to']} will not be installed again automatically. The next version will be tried normally, or you can update by hand once the problem is understood.\n\nOnly the code was put back. If something still looks wrong (an update can also change the database), the database snapshot taken just before can be put back from Dashboard > Safe updates.\n\nWhat failed before the fix:\n" . self::format_failures( self::$last_failures )
-			);
+			self::remember_for_week( array_udiff( $updated, $restored, function ( $a, $b ) { return strcmp( $a['key'], $b['key'] ); } ) );
+			self::mail_html( "Update undone: {$culprit['name']} {$culprit['to']}", [
+				'tone'   => 'amber',
+				'badge'  => 'Update undone',
+				'title'  => "{$culprit['name']} {$culprit['to']} was undone",
+				'lead'   => "After the automatic updates, the page checks failed. Safe updates put back the previous version and the site passes its checks again. {$culprit['name']} {$culprit['to']} won't be installed again automatically: the next version will be tried normally, or you can update by hand once the problem is understood.",
+				'groups' => [
+					[ 'What failed', self::failure_items( self::$last_failures ) ],
+					[ 'Put back', self::update_items( $restored, true ) ],
+					[ 'Installed in this round', self::update_items( $updated ) ],
+				],
+				'note'   => 'Only the code was put back. If something still looks wrong (an update can also change the database), the database snapshot taken just before can be put back from Settings > Safe updates.',
+				'button' => [ 'Open Safe updates', self::page_url() ],
+			] );
 		} else {
-			$snap = self::snapshots()[0] ?? null;
-			$b    = self::updraft_backup();
-			self::mail(
-				'URGENT: the site has a problem after updates',
-				"These updates were installed automatically:\n\n$list\n\nThe page checks fail, and putting back the previous versions did not fix it" . ( $restored ? '' : ' (no saved copy could be used)' ) . ".\n\nWhat fails:\n" . self::format_failures( $check['failures'] ) .
-				"\n\nThe database snapshot from " . ( $snap ? wp_date( 'Y-m-d H:i', $snap['time'] ) : '(none found)' ) . ' can be put back from Dashboard > Safe updates (anything saved since will be lost).' .
-				( $b ? "\nThere is also an UpdraftPlus backup from " . wp_date( 'Y-m-d H:i', $b['time'] ) . ' (Settings > UpdraftPlus Backups > Restore).' : '' )
-			);
+			$snap  = self::snapshots()[0] ?? null;
+			$b     = self::updraft_backup();
+			$facts = [ [ 'Database snapshot', $snap ? self::email_date( $snap['time'] ) . ' (put back from Settings > Safe updates; anything saved since is lost)' : 'none found' ] ];
+			if ( $b ) {
+				$facts[] = [ 'UpdraftPlus backup', self::email_date( $b['time'] ) . ' (Settings > UpdraftPlus Backups > Restore)' ];
+			}
+			self::mail_html( 'URGENT: the site has a problem after updates', [
+				'tone'   => 'red',
+				'badge'  => 'Urgent',
+				'title'  => 'The site has a problem after updates',
+				'lead'   => 'The page checks fail after the automatic updates, and putting back the previous versions did not fix it' . ( $restored ? '' : ' (no saved copy could be used)' ) . '. Someone needs to look at the site now.',
+				'groups' => [
+					[ 'What fails', self::failure_items( $check['failures'] ) ],
+					[ 'Installed in this round', self::update_items( $updated ) ],
+				],
+				'facts'      => $facts,
+				'facts_last' => true, // What fails first, then how to get back.
+				'button'     => [ 'Open Safe updates', self::page_url() ],
+			] );
 		}
 	}
 
@@ -768,12 +804,29 @@ final class EgoWebDesign_Safe_Updates {
 		$check  = self::run_checks();
 		$was_ok = $before['ok'] ?? true;
 		if ( ! $check['ok'] && ( $was_ok || 'manual' === $why ) ) {
-			$copies = get_option( 'msu_copies', [] );
-			$recent = array_filter( $copies, function ( $c ) { return time() - $c['time'] < DAY_IN_SECONDS; } );
-			$hint   = $recent ? "\n\nRecently updated (a copy of the previous version is saved; you can put it back from the Dashboard > Safe updates box):\n" . implode( "\n", array_map( function ( $c ) { return "- {$c['name']} (previous version {$c['version']})"; }, $recent ) ) : '';
-			self::mail( 'Problem detected on the website', "The page checks found a problem:\n\n" . self::format_failures( $check['failures'] ) . $hint );
+			$recent = array_filter( get_option( 'msu_copies', [] ), function ( $c ) { return time() - $c['time'] < DAY_IN_SECONDS; } );
+			$n      = count( $check['failures'] );
+			self::mail_html( 'Problem detected on the website', [
+				'tone'   => 'red',
+				'badge'  => 'Problem',
+				'title'  => 1 === $n ? 'A page check fails' : "$n page checks fail",
+				'lead'   => 'manual' === $why ? 'Safe updates checked the site a minute after an update made by hand, and found a problem.' : 'The twice-daily check found a problem on the site.',
+				'groups' => [
+					[ 'What fails', self::failure_items( $check['failures'] ) ],
+					[ 'Updated in the last 24 h', array_map( function ( $c ) { return [ $c['name'], "previous version {$c['version']} saved, can be put back" ]; }, array_values( $recent ) ) ],
+				],
+				'note'   => $recent ? 'If an update caused this, put back its previous version from Settings > Safe updates.' : '',
+				'button' => [ 'Open Safe updates', self::page_url() ],
+			] );
 		} elseif ( $check['ok'] && ! $was_ok ) {
-			self::mail( 'Website OK again', 'The page checks pass again.' );
+			$n = count( self::pages() );
+			self::mail_html( 'Website OK again', [
+				'tone'   => 'green',
+				'badge'  => 'Back to normal',
+				'title'  => 'The site passes its checks again',
+				'lead'   => 1 === $n ? 'The page checked loads normally again.' : "All $n pages checked load normally again.",
+				'button' => [ 'Open the site', home_url( '/' ) ],
+			] );
 		}
 		self::security_scan();
 		if ( time() - ( get_option( 'msu_registry', [] )['time'] ?? 0 ) > DAY_IN_SECONDS - HOUR_IN_SECONDS ) {
@@ -781,9 +834,148 @@ final class EgoWebDesign_Safe_Updates {
 		}
 	}
 
-	private static function format_failures( $failures ) {
-		return implode( "\n", array_map( function ( $k, $v ) { return "- $k: $v"; }, array_keys( $failures ), $failures ) );
+	/* ------------------------------------------------------------------ Weekly summary */
+
+	/** Updates that went well are told once a week, instead of in one email each. */
+	private static function remember_for_week( $updated ) {
+		$week = get_option( 'msu_week', [] );
+		foreach ( $updated as $u ) {
+			$week[] = [ 'time' => time(), 'name' => $u['name'], 'from' => $u['from'], 'to' => $u['to'] ];
+		}
+		update_option( 'msu_week', array_slice( $week, -200 ), false );
 	}
+
+	/** Monday morning: what was installed during the week, and how the site is doing. Nothing installed, no email. */
+	public static function weekly_summary() {
+		$week = get_option( 'msu_week', [] );
+		update_option( 'msu_week', [], false );
+		if ( ! $week ) {
+			return;
+		}
+		$c     = get_option( 'msu_last_check', [] );
+		$open  = count( get_option( 'msu_security', [] )['open'] ?? [] );
+		$snap  = self::snapshots()[0] ?? null;
+		$held  = self::held();
+		$ok    = ! empty( $c['ok'] ) && ! $open;
+		$n     = count( $week );
+		$facts = [
+			[ 'Page checks', empty( $c['time'] ) ? 'not run yet' : ( $c['ok'] ? 'all pass' : count( $c['failures'] ) . ' failing' ) ],
+			[ 'Security', $open ? "$open to review" : 'nothing suspicious' ],
+			[ 'Last snapshot', $snap ? self::email_date( $snap['time'] ) : 'none yet' ],
+		];
+		if ( $held ) {
+			$facts[] = [ 'Big releases waiting', implode( ', ', array_map( function ( $s ) { return "{$s['name']} {$s['version']}"; }, $held ) ) ];
+		}
+		self::mail_html( "Weekly summary: $n update" . ( 1 === $n ? '' : 's' ) . ' installed', [
+			'tone'   => $ok ? 'green' : 'amber',
+			'badge'  => 'Weekly summary',
+			'title'  => 1 === $n ? '1 update installed this week' : "$n updates installed this week",
+			'lead'   => 'Each one was installed right after a database snapshot, and the site passed its page checks afterwards.' . ( $ok ? '' : ' Something still needs attention, see below.' ),
+			'facts'  => $facts,
+			'groups' => [ [ 'Installed', array_map( function ( $w ) { return [ $w['name'], ( $w['from'] ? "{$w['from']} → {$w['to']}" : $w['to'] ) . ' · ' . self::email_date( $w['time'], 'l M j' ) ]; }, $week ) ] ],
+			'button' => [ 'Open Safe updates', self::page_url() ],
+			'footer' => 'Sent on Mondays when updates were installed. Problems are emailed right away.',
+		] );
+		self::log( "Weekly summary sent ($n update" . ( 1 === $n ? '' : 's' ) . ').' );
+	}
+
+	/* ------------------------------------------------------------------ What to check, suggested from the site */
+
+	/**
+	 * Suggests checks from the site itself: the home page and the main menu's pages that load now, a form marker on
+	 * pages that have a form, the Elementor header and footer when the home page has them, WPML's language switcher.
+	 * Returns ['pages' => lines, 'markers' => lines, 'names' => page names].
+	 */
+	public static function suggest_checks() {
+		$forms = [ 'class="elementor-form"', 'class="wpcf7-form', 'class="wpforms-form', 'gform_wrapper', 'class="jet-form-builder', 'class="frm-show-form' ];
+		$form  = function ( $html ) use ( $forms ) {
+			foreach ( $forms as $f ) {
+				if ( false !== strpos( $html, $f ) ) {
+					return $f;
+				}
+			}
+			return '';
+		};
+		$res   = self::fetch( home_url( '/' ) );
+		$home  = is_wp_error( $res ) ? '' : wp_remote_retrieve_body( $res );
+		$pages = [ [ 0 === strpos( get_locale(), 'fr' ) ? 'Accueil' : 'Home', '/', $form( $home ) ] ];
+		$base  = (string) wp_parse_url( home_url( '/' ), PHP_URL_PATH ); // "/" or "/dev/" for a site in a folder.
+		$host  = wp_parse_url( home_url(), PHP_URL_HOST );
+		$seen  = [ '/' => true ];
+		foreach ( self::main_menu_items() as $item ) {
+			if ( count( $pages ) >= 9 ) {
+				break;
+			}
+			$url  = (string) $item->url;
+			$path = (string) wp_parse_url( $url, PHP_URL_PATH );
+			if ( ( wp_parse_url( $url, PHP_URL_HOST ) && wp_parse_url( $url, PHP_URL_HOST ) !== $host ) || '' === $path || 0 !== strpos( $path, $base ) ) {
+				continue; // Another site, an anchor, or outside this site's folder.
+			}
+			$path = '/' . ltrim( substr( $path, strlen( $base ) ), '/' );
+			if ( isset( $seen[ $path ] ) || preg_match( '#\.(pdf|jpe?g|png|zip|docx?)$#i', $path ) ) {
+				continue;
+			}
+			$seen[ $path ] = true;
+			$res           = self::fetch( home_url( $path ) );
+			if ( is_wp_error( $res ) || 200 !== wp_remote_retrieve_response_code( $res ) ) {
+				continue; // Only pages that work now.
+			}
+			$name    = str_replace( '|', '/', mb_substr( trim( wp_strip_all_tags( $item->title ) ), 0, 40 ) );
+			$pages[] = [ $name ?: $path, $path, $form( wp_remote_retrieve_body( $res ) ) ];
+		}
+
+		$markers = [ '</html> | page is cut off' ];
+		foreach ( [ 'elementor-location-header' => 'header missing', 'elementor-location-footer' => 'footer missing' ] as $marker => $why ) {
+			if ( false !== strpos( $home, $marker ) ) {
+				$markers[] = "$marker | $why";
+			}
+		}
+		if ( defined( 'ICL_SITEPRESS_VERSION' ) && false !== strpos( $home, 'wpml-ls' ) ) {
+			$markers[] = 'wpml-ls | language switcher missing';
+		}
+		return [
+			'pages'   => implode( "\n", array_map( function ( $p ) { return rtrim( implode( ' | ', $p ), ' |' ); }, $pages ) ),
+			'markers' => implode( "\n", $markers ),
+			'names'   => array_column( $pages, 0 ),
+		];
+	}
+
+	/** The menu in the theme's main location, or else the biggest menu (Elementor menus often have no location). */
+	private static function main_menu_items() {
+		$locations = array_filter( get_nav_menu_locations() );
+		$menu      = null;
+		foreach ( [ 'primary', 'main', 'main-menu', 'menu-1', 'header', 'header-menu', 'top' ] as $loc ) {
+			if ( ! empty( $locations[ $loc ] ) ) {
+				$menu = $locations[ $loc ];
+				break;
+			}
+		}
+		if ( ! $menu && $locations ) {
+			$menu = reset( $locations );
+		}
+		if ( ! $menu ) {
+			$most = 0;
+			foreach ( wp_get_nav_menus() as $m ) {
+				if ( $m->count > $most ) {
+					$most = $m->count;
+					$menu = $m->term_id;
+				}
+			}
+		}
+		return $menu ? (array) wp_get_nav_menu_items( $menu ) : [];
+	}
+
+	/** New install: fill in what to check from the site, unless someone already saved settings. */
+	public static function auto_configure() {
+		if ( false !== get_option( 'msu_settings' ) ) {
+			return;
+		}
+		$s = self::suggest_checks();
+		update_option( 'msu_settings', [ 'pages' => $s['pages'], 'markers' => $s['markers'] ] + self::settings(), false );
+		self::log( 'Pages to check filled in from the site: ' . implode( ', ', $s['names'] ) . '.' );
+		self::run_checks();
+	}
+
 
 	/* ------------------------------------------------------------------ Security watch */
 
@@ -1093,20 +1285,22 @@ final class EgoWebDesign_Safe_Updates {
 		$admins = array_filter( $new, function ( $f ) { return 'admin' === $f['type']; } );
 		$n      = count( $new );
 		$title  = 1 === $n && $admins ? 'New administrator account' : ( 1 === $n ? 'One thing to check' : "$n things to check" );
-		$rows   = [];
+		$items  = [];
 		foreach ( array_slice( $new, 0, 15 ) as $f ) {
-			$rows[] = [ $f['title'], $f['detail'] ];
+			$items[] = [ $f['title'], $f['detail'] ];
 		}
 		if ( $n > 15 ) {
-			$rows[] = [ 'And ' . ( $n - 15 ) . ' more', 'listed in Settings > Safe updates' ];
+			$items[] = [ 'And ' . ( $n - 15 ) . ' more', 'listed in Settings > Safe updates' ];
 		}
 		self::mail_html( "Security: $title", [
+			'tone'   => 'red',
 			'badge'  => 'Security',
 			'title'  => $title,
 			'lead'   => 'Safe updates found changes an intruder could have made. If you or someone you trust did this, mark it as reviewed. If not, act now: remove unknown administrators, change the admin passwords, and replace changed files with clean copies.',
-			'rows'   => $rows,
+			'groups' => [ [ '', $items, true ] ],
 			'button' => [ 'Review in Safe updates', self::page_url() ],
 			'note'   => count( $open ) > $n ? ( count( $open ) - $n ) . ' earlier finding' . ( count( $open ) - $n > 1 ? 's are' : ' is' ) . ' also still open.' : '',
+			'footer' => 'Safe updates checks this twice a day and right after any role change.',
 		] );
 	}
 
@@ -1669,6 +1863,11 @@ document.addEventListener('click', function (e) {
 		$markers = self::split_lines( $s['markers'], 2 );
 		$has     = implode( ' ', array_column( $markers, 0 ) );
 
+		echo '<div class="card"><h2>Suggest from the site</h2><p class="description">Fills the two lists below from the site itself: the home page and the pages of the main menu that load now, a form check on pages with a form, and the Elementor header and footer when the site has them. It replaces what is there.</p>';
+		echo '<div class="msu-actions">';
+		self::action_button( 'msu_suggest', 'Fill in from the site', [], 'button', 'Replace the pages and texts to check with suggestions from the site?', 'Looking at the site…' );
+		echo '</div></div>';
+
 		echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
 		wp_nonce_field( 'msu_save_settings' );
 		echo '<input type="hidden" name="action" value="msu_save_settings">';
@@ -1741,6 +1940,8 @@ document.addEventListener('click', function (e) {
 			'db-restored'     => [ 'success', "Database put back as it was on $item. Page checks pass." ],
 			'db-restored-ko'  => [ 'warning', "Database put back as it was on $item, but page checks still fail." ],
 			'db-restore-failed' => [ 'error', "Could not put the database back: $item" ],
+			'suggested'         => [ 'success', "Filled in from the site: $item pages to check. They all pass." ],
+			'suggested-ko'      => [ 'warning', "Filled in from the site: $item pages to check, but a check fails. See the Overview tab." ],
 			'security-clean'    => [ 'success', 'Security scan done: nothing suspicious.' ],
 			'security-found'    => [ 'error', "Security scan done: $item to review. Details are in Settings > Safe updates." ],
 			'security-reviewed' => [ 'success', 'Marked as reviewed. Those findings will not be reported again unless they change.' ],
@@ -1788,6 +1989,17 @@ document.addEventListener('click', function (e) {
 			self::schedule_register();
 		}
 		self::back( 'saved' );
+	}
+
+	public static function admin_suggest() {
+		check_admin_referer( 'msu_suggest' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$s = self::suggest_checks();
+		update_option( 'msu_settings', [ 'pages' => $s['pages'], 'markers' => $s['markers'] ] + self::settings(), false );
+		self::log( 'Pages to check filled in from the site by ' . wp_get_current_user()->user_login . ': ' . implode( ', ', $s['names'] ) . '.' );
+		self::back( self::run_checks()['ok'] ? 'suggested' : 'suggested-ko', (string) count( $s['names'] ) );
 	}
 
 	public static function admin_new_key() {
@@ -1890,30 +2102,71 @@ document.addEventListener('click', function (e) {
 		update_option( 'msu_log', array_slice( $log, -50 ), false );
 	}
 
-	private static function mail( $subject, $body ) {
-		$body .= "\n\n— Safe updates, " . home_url( '/' ) . "\nDashboard: " . admin_url();
-		$s = self::settings();
-		wp_mail( $s['email'], '[' . ( $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST ) ) . '] ' . $subject, $body );
-	}
-
 	/**
-	 * A designed email (the same look as the watcher's), with a plain-text copy for mail apps without HTML.
-	 * $m: badge, title, lead, rows [[label, value]], button [label, url], note.
+	 * Every email the plugin sends: the same card design as the watcher's, with a plain-text copy for mail apps without HTML.
+	 * $m: tone (red | amber | green | blue), badge, title, lead,
+	 *     facts  [[label, value]]                                   two-column table,
+	 *     groups [[heading, [[title, detail], ...], mono], ...]     lists (mono: details are file paths),
+	 *     facts_last (facts after the lists), note, button [label, url], footer.
 	 */
 	private static function mail_html( $subject, $m ) {
-		$s     = self::settings();
-		$site  = $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST );
-		$e     = function ( $v ) { return esc_html( (string) $v ); };
-		$font  = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-		$red   = '#C4320A';
-		$rows  = '';
-		$text  = "{$m['title']}\n\n{$m['lead']}\n\n";
-		foreach ( $m['rows'] as $r ) {
-			$rows .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;vertical-align:top;"><div style="font-size:14px;font-weight:600;color:#101828;">' . $e( $r[0] ) . '</div>'
-				. '<div style="font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.5;color:#475467;word-break:break-all;padding-top:2px;">' . $e( $r[1] ) . '</div></td></tr>';
-			$text .= "- {$r[0]}: {$r[1]}\n";
+		$s    = self::settings();
+		$site = $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST );
+		$e    = function ( $v ) { return esc_html( (string) $v ); };
+		$font = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+		list( $accent, $tint ) = [
+			'red'   => [ '#C4320A', '#FEF3EE' ],
+			'amber' => [ '#B54708', '#FFF8EB' ],
+			'green' => [ '#067647', '#ECFDF3' ],
+			'blue'  => [ '#1F4FD8', '#EEF3FF' ],
+		][ $m['tone'] ?? 'red' ];
+		$text  = "{$m['title']}\n\n{$m['lead']}\n";
+		$body  = '';
+		$facts = function () use ( $m, $font, $e, &$body, &$text ) {
+			if ( empty( $m['facts'] ) ) {
+				return;
+			}
+			$body .= '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;">';
+			$text .= "\n";
+			foreach ( $m['facts'] as $f ) {
+				$body .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#667085;font-size:13px;width:130px;vertical-align:top;">' . $e( $f[0] ) . '</td>'
+					. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#101828;font-size:14px;vertical-align:top;">' . $e( $f[1] ) . '</td></tr>';
+				$text .= "{$f[0]}: {$f[1]}\n";
+			}
+			$body .= '</table>';
+		};
+
+		if ( empty( $m['facts_last'] ) ) {
+			$facts();
 		}
-		$text .= ( $m['note'] ? "\n{$m['note']}\n" : '' ) . "\n{$m['button'][0]}: {$m['button'][1]}\n";
+		foreach ( $m['groups'] ?? [] as $g ) {
+			list( $heading, $items, $mono ) = array_pad( $g, 3, false );
+			if ( ! $items ) {
+				continue;
+			}
+			$body .= ( $heading ? '<div style="' . $font . 'margin:22px 0 2px;font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#98A2B3;">' . $e( $heading ) . '</div>' : '<div style="height:20px;"></div>' )
+				. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">';
+			$text .= "\n" . ( $heading ? "$heading:\n" : '' );
+			foreach ( $items as $i ) {
+				$detail = '' === (string) ( $i[1] ?? '' ) ? '' : '<div style="' . ( $mono ? 'font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;' : $font . 'font-size:13px;' ) . 'line-height:1.5;color:#475467;padding-top:2px;">' . $e( $i[1] ) . '</div>';
+				$body  .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;vertical-align:top;"><div style="font-size:14px;font-weight:600;color:#101828;">' . $e( $i[0] ) . '</div>' . $detail . '</td></tr>';
+				$text  .= "- {$i[0]}" . ( '' === (string) ( $i[1] ?? '' ) ? '' : ": {$i[1]}" ) . "\n";
+			}
+			$body .= '</table>';
+		}
+		if ( ! empty( $m['facts_last'] ) ) {
+			$facts();
+		}
+		if ( ! empty( $m['note'] ) ) {
+			$body .= '<p style="' . $font . 'margin:16px 0 0;font-size:13px;line-height:1.5;color:#667085;">' . $e( $m['note'] ) . '</p>';
+			$text .= "\n{$m['note']}\n";
+		}
+		if ( ! empty( $m['button'] ) ) {
+			$body .= '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0 0;"><tr><td style="border-radius:8px;background:' . $accent . ';">'
+				. '<a href="' . esc_url( $m['button'][1] ) . '" style="' . $font . 'display:inline-block;padding:12px 20px;font-size:14px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;">' . $e( $m['button'][0] ) . ' &rarr;</a></td></tr></table>';
+			$text .= "\n{$m['button'][0]}: {$m['button'][1]}\n";
+		}
+		$footer = $m['footer'] ?? 'Safe updates watches this site\'s updates, pages and security.';
 
 		$html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>' . $e( $m['title'] ) . '</title></head>'
 			. '<body style="margin:0;padding:0;background:#F2F4F7;"><div style="display:none;max-height:0;overflow:hidden;">' . $e( $m['lead'] ) . '</div>'
@@ -1922,16 +2175,13 @@ document.addEventListener('click', function (e) {
 			. '<tr><td style="' . $font . 'padding:0 4px 14px;font-size:13px;color:#475467;"><span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:6px;background:#101828;color:#FFFFFF;font-size:12px;font-weight:700;vertical-align:middle;margin-right:8px;">S</span>'
 			. '<span style="vertical-align:middle;font-weight:600;color:#101828;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; ' . $e( $site ) . '</span></td></tr>'
 			. '<tr><td style="background:#FFFFFF;border:1px solid #EAECF0;border-radius:14px;overflow:hidden;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
-			. '<tr><td style="height:4px;background:' . $red . ';font-size:0;line-height:0;">&nbsp;</td></tr><tr><td style="padding:28px 32px 28px;">'
-			. '<span style="' . $font . 'display:inline-block;padding:4px 10px;border-radius:999px;background:#FEF3EE;color:' . $red . ';font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">' . $e( $m['badge'] ) . '</span>'
+			. '<tr><td style="height:4px;background:' . $accent . ';font-size:0;line-height:0;">&nbsp;</td></tr><tr><td style="padding:28px 32px 28px;">'
+			. '<span style="' . $font . 'display:inline-block;padding:4px 10px;border-radius:999px;background:' . $tint . ';color:' . $accent . ';font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">' . $e( $m['badge'] ) . '</span>'
 			. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#101828;">' . $e( $m['title'] ) . '</h1>'
 			. '<p style="' . $font . 'margin:0;font-size:15px;line-height:1.55;color:#344054;">' . $e( $m['lead'] ) . '</p>'
-			. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;">' . $rows . '</table>'
-			. ( $m['note'] ? '<p style="' . $font . 'margin:12px 0 0;font-size:13px;color:#667085;">' . $e( $m['note'] ) . '</p>' : '' )
-			. '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0 0;"><tr><td style="border-radius:8px;background:' . $red . ';">'
-			. '<a href="' . esc_url( $m['button'][1] ) . '" style="' . $font . 'display:inline-block;padding:12px 20px;font-size:14px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;">' . $e( $m['button'][0] ) . ' &rarr;</a></td></tr></table>'
+			. $body
 			. '</td></tr></table></td></tr>'
-			. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">' . $e( home_url( '/' ) ) . ' · Safe updates checks this twice a day and right after any role change.</td></tr>'
+			. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">' . $e( home_url( '/' ) ) . ' · ' . $e( $footer ) . '</td></tr>'
 			. '</table></td></tr></table></body></html>';
 
 		$alt = function ( $mailer ) use ( $text ) { $mailer->AltBody = $text; };
@@ -1941,14 +2191,31 @@ document.addEventListener('click', function (e) {
 		return $sent;
 	}
 
-	/** Same alert at most once a day. */
-	private static function alert_once( $id, $subject, $body ) {
+	/** The same alert at most once a day. */
+	private static function alert_once( $id, $subject, $m ) {
 		$key = 'msu_alert_' . $id;
 		if ( ! get_transient( $key ) ) {
 			set_transient( $key, 1, DAY_IN_SECONDS );
 			self::log( $subject );
-			self::mail( $subject, $body );
+			self::mail_html( $subject, $m );
 		}
+	}
+
+	/** Dates in emails: the site's time zone, always in English like the rest of the email (wp_date() would translate the day names). */
+	private static function email_date( $t, $format = 'M j, H:i' ) {
+		return ( new DateTime( '@' . (int) $t ) )->setTimezone( wp_timezone() )->format( $format );
+	}
+
+	/** [[page, what fails]] for an email list. */
+	private static function failure_items( $failures ) {
+		return array_map( function ( $page, $why ) { return [ $page, ucfirst( $why ) ]; }, array_keys( $failures ), $failures );
+	}
+
+	/** [[name, from → to]] for an email list. */
+	private static function update_items( $updated, $back = false ) {
+		return array_map( function ( $u ) use ( $back ) {
+			return [ $u['name'], $u['from'] ? ( $back ? "back to {$u['from']} (from {$u['to']})" : "{$u['from']} → {$u['to']}" ) : $u['to'] ];
+		}, $updated );
 	}
 }
 
