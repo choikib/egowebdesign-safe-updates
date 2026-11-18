@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.3.0
+ * Version: 2.3.1
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.3.0';
+	const VERSION        = '2.3.1';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
@@ -726,7 +726,7 @@ final class EgoWebDesign_Safe_Updates {
 		return implode( "\n", array_map( function ( $k, $v ) { return "- $k: $v"; }, array_keys( $failures ), $failures ) );
 	}
 
-	/* ------------------------------------------------------------------ Status page (UptimeRobot) and update report */
+	/* ------------------------------------------------------------------ Status page (for the watcher) and update report */
 
 	public static function register_status_route() {
 		$status = [
@@ -1286,7 +1286,7 @@ document.addEventListener('click', function (e) {
 		self::action_button( 'msu_new_key', 'Make a new link', [], 'button-link button-link-delete', 'The current link will stop working right away. Continue?' );
 		echo '<span class="msu-muted">Use this if the link was shared by mistake.</span></div></div>';
 
-		echo '<div class="card"><h2>Status link</h2><p class="description">For UptimeRobot. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running.</p>';
+		echo '<div class="card"><h2>Status link</h2><p class="description">For the EgoWebDesign watcher, which checks it every 5 minutes and emails when the site goes down or comes back. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running. To watch this site, add it to the watcher\'s list.</p>';
 		echo '<div class="msu-field"><input id="msu-status" type="text" readonly class="code" value="' . esc_attr( rest_url( 'egowebdesign/v1/status' ) ) . '"><button type="button" class="button" data-msu-copy="msu-status">Copy</button></div></div>';
 	}
 
