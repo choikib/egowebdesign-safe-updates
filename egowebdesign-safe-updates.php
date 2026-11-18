@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,7 +12,7 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.2.0';
+	const VERSION        = '2.3.0';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
