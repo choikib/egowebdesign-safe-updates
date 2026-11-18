@@ -1,7 +1,7 @@
 <?php
 /**
  * Plugin Name: EgoWebDesign – Safe updates
- * Description: Runs WordPress, plugin and theme updates automatically, but only after a fresh UpdraftPlus backup. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
+ * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
  * Version: 2.2.0
  * Author: EgoWebDesign
  * Requires PHP: 7.4
@@ -16,7 +16,8 @@ final class EgoWebDesign_Safe_Updates {
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
-	const BACKUP_MAX_AGE = 20 * HOUR_IN_SECONDS;  // A backup older than this doesn't count as "fresh".
+	const SNAPSHOT_MAX_AGE = HOUR_IN_SECONDS;     // Updates need a database snapshot at most this old (one is taken on the spot).
+	const SNAPSHOTS_KEPT = 3;
 	const STALE_CHECK    = 36 * HOUR_IN_SECONDS;  // The status page reports a problem if checks stop running.
 
 	/** True while WordPress's automatic updater is running (not when an admin looks at the Plugins screen). */
@@ -43,6 +44,9 @@ final class EgoWebDesign_Safe_Updates {
 		if ( ! get_option( 'msu_report_key' ) ) {
 			update_option( 'msu_report_key', wp_generate_password( 32, false ), false );
 		}
+		// Left over from 2.2 and before, when backups were made by UpdraftPlus.
+		wp_clear_scheduled_hook( 'msu_run_backup' );
+		delete_option( 'msu_backup_requested' );
 		update_option( 'msu_version', self::VERSION, false );
 	}
 
@@ -94,9 +98,6 @@ final class EgoWebDesign_Safe_Updates {
 		add_action( 'automatic_updates_complete', [ __CLASS__, 'after_auto_updates' ] );
 		add_action( 'upgrader_process_complete', [ __CLASS__, 'after_manual_update' ], 10, 2 );
 
-		add_action( 'msu_run_backup', function () {
-			do_action( 'updraft_backupnow_backup_all', [] );
-		} );
 		add_action( 'msu_check', [ __CLASS__, 'scheduled_check' ] );
 		add_action( 'init', function () {
 			if ( ! wp_next_scheduled( 'msu_check' ) ) {
@@ -109,6 +110,8 @@ final class EgoWebDesign_Safe_Updates {
 		add_action( 'admin_post_msu_check_now', [ __CLASS__, 'admin_check_now' ] );
 		add_action( 'admin_post_msu_restore', [ __CLASS__, 'admin_restore' ] );
 		add_action( 'admin_post_msu_unblock', [ __CLASS__, 'admin_unblock' ] );
+		add_action( 'admin_post_msu_snapshot_now', [ __CLASS__, 'admin_snapshot_now' ] );
+		add_action( 'admin_post_msu_restore_db', [ __CLASS__, 'admin_restore_db' ] );
 		add_action( 'admin_notices', [ __CLASS__, 'admin_notice' ] );
 
 		add_filter( 'update_plugins_github.com', [ __CLASS__, 'check_own_update' ], 10, 3 );
@@ -197,7 +200,7 @@ final class EgoWebDesign_Safe_Updates {
 			return false; // This version broke the site before; wait for the next one or a manual update.
 		}
 
-		// This plugin's own releases skip the hold (they still wait for a fresh backup).
+		// This plugin's own releases skip the hold (they still get a database snapshot first).
 		$major = 'plugin:' . plugin_basename( __FILE__ ) !== $key && self::is_major( $current, $new );
 		if ( $major ) {
 			$seen = get_option( 'msu_seen', [] );
@@ -211,8 +214,7 @@ final class EgoWebDesign_Safe_Updates {
 			}
 		}
 
-		if ( ! self::backup_is_fresh() ) {
-			self::request_backup( "$name $new" );
+		if ( ! self::ensure_snapshot( "$name $new" ) ) {
 			return false;
 		}
 
@@ -249,41 +251,175 @@ final class EgoWebDesign_Safe_Updates {
 		return $plugins[ $id ]['Name'] ?? $id;
 	}
 
-	/* ------------------------------------------------------------------ Backups (UpdraftPlus) */
+	/* ------------------------------------------------------------------ Database snapshots */
 
-	/** Last complete UpdraftPlus backup: [time, ok]. */
-	public static function last_backup() {
+	/** True once a snapshot failed during this request, so the next update in the same run doesn't retry it. */
+	private static $snapshot_failed = false;
+
+	private static function snapshots_dir() {
+		$dir = self::copies_dir() . '/db';
+		if ( ! is_dir( $dir ) ) {
+			wp_mkdir_p( $dir );
+			file_put_contents( $dir . '/index.php', "<?php // Silence.\n" );
+		}
+		return $dir;
+	}
+
+	/** Finished snapshots, newest first: [file, time, size]. */
+	public static function snapshots() {
+		$list = [];
+		foreach ( glob( self::snapshots_dir() . '/db-*.sql.gz' ) ?: [] as $path ) {
+			$list[] = [ 'file' => basename( $path ), 'time' => filemtime( $path ), 'size' => filesize( $path ) ];
+		}
+		usort( $list, function ( $a, $b ) { return $b['time'] - $a['time']; } );
+		return $list;
+	}
+
+	/** Updates need a snapshot taken in the last hour; one is taken on the spot otherwise. Never more than one try per request. */
+	private static function ensure_snapshot( $reason ) {
+		$last = self::snapshots()[0] ?? null;
+		if ( $last && time() - $last['time'] < self::SNAPSHOT_MAX_AGE ) {
+			return true;
+		}
+		if ( self::$snapshot_failed ) {
+			return false;
+		}
+		$res = self::take_snapshot( $reason );
+		if ( is_wp_error( $res ) ) {
+			self::$snapshot_failed = true;
+			self::log( "Update waiting ($reason): the database snapshot failed: " . $res->get_error_message() );
+			self::alert_once( 'snapshot-failing', 'Updates are on hold: the database snapshot failed', "Safe updates only install updates after saving a copy of the database, and that failed:\n\n" . $res->get_error_message() . "\n\nUpdates will be tried again on WordPress's next update round (about 12 h)." );
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Saves the site's database tables to a gzipped SQL file, one statement per line.
+	 * Read inside one transaction so the copy is consistent even if the site writes meanwhile.
+	 */
+	public static function take_snapshot( $reason ) {
+		global $wpdb;
+		if ( ! function_exists( 'gzopen' ) ) {
+			return new WP_Error( 'msu_zlib', 'PHP zlib is not available.' );
+		}
+		if ( function_exists( 'set_time_limit' ) ) {
+			set_time_limit( 600 );
+		}
+		$path = self::snapshots_dir() . '/db-' . gmdate( 'Ymd-His' ) . '-' . wp_generate_password( 12, false ) . '.sql.gz'; // Random part: not guessable on servers that ignore .htaccess.
+		$gz   = gzopen( "$path.part", 'wb6' );
+		if ( ! $gz ) {
+			return new WP_Error( 'msu_write', 'Could not write in ' . self::snapshots_dir() . '.' );
+		}
+		$ok    = true;
+		$write = function ( $s ) use ( $gz, &$ok ) {
+			$ok = $ok && strlen( $s ) === gzwrite( $gz, $s );
+		};
+
+		$write( "-- Safe updates database snapshot, " . gmdate( 'c' ) . ", before $reason\nSET NAMES " . ( $wpdb->charset ?: 'utf8mb4' ) . ";\nSET foreign_key_checks = 0;\n" );
+		$wpdb->query( 'START TRANSACTION WITH CONSISTENT SNAPSHOT' );
+		$tables = $wpdb->get_results( $wpdb->prepare( 'SHOW FULL TABLES LIKE %s', $wpdb->esc_like( $wpdb->prefix ) . '%' ), ARRAY_N );
+		foreach ( $tables as $t ) {
+			if ( 'BASE TABLE' !== $t[1] ) {
+				continue;
+			}
+			$table  = $t[0];
+			$create = $wpdb->get_row( "SHOW CREATE TABLE `$table`", ARRAY_N );
+			if ( empty( $create[1] ) ) {
+				$ok = false;
+				break;
+			}
+			$write( "DROP TABLE IF EXISTS `$table`;\n" . str_replace( [ "\r", "\n" ], ' ', $create[1] ) . ";\n" );
+			for ( $offset = 0; $ok; $offset += 500 ) {
+				$rows = $wpdb->get_results( "SELECT * FROM `$table` LIMIT $offset, 500", ARRAY_N );
+				if ( $wpdb->last_error ) {
+					$ok = false;
+				}
+				if ( ! $rows ) {
+					break;
+				}
+				$values = [];
+				foreach ( $rows as $row ) {
+					$values[] = '(' . implode( ',', array_map( function ( $v ) use ( $wpdb ) {
+						return null === $v ? 'NULL' : "'" . $wpdb->remove_placeholder_escape( $wpdb->_real_escape( $v ) ) . "'"; // Escapes line breaks too, so each statement stays on one line.
+					}, $row ) ) . ')';
+				}
+				$write( "INSERT INTO `$table` VALUES " . implode( ',', $values ) . ";\n" );
+			}
+		}
+		$wpdb->query( 'COMMIT' );
+		$write( "SET foreign_key_checks = 1;\n" );
+		gzclose( $gz );
+
+		if ( ! $ok || ! rename( "$path.part", $path ) ) {
+			@unlink( "$path.part" );
+			return new WP_Error( 'msu_snapshot', 'The database could not be read or the file could not be written (disk full?).' );
+		}
+		foreach ( array_slice( self::snapshots(), self::SNAPSHOTS_KEPT ) as $old ) {
+			unlink( self::snapshots_dir() . '/' . $old['file'] );
+		}
+		delete_transient( 'msu_alert_snapshot-failing' );
+		self::log( 'Database snapshot saved (' . size_format( filesize( $path ) ) . ") before $reason." );
+		return true;
+	}
+
+	/** Puts the whole database back as it was in a snapshot. This plugin's own state (log, saved copies, blocked versions) stays as it is now. */
+	public static function restore_snapshot( $file ) {
+		global $wpdb;
+		$file = basename( (string) $file );
+		$path = self::snapshots_dir() . '/' . $file;
+		if ( ! preg_match( '/^db-[\w-]+\.sql\.gz$/', $file ) || ! is_file( $path ) ) {
+			return new WP_Error( 'msu_no_snapshot', 'No such snapshot.' );
+		}
+		if ( function_exists( 'set_time_limit' ) ) {
+			set_time_limit( 900 );
+		}
+		$keep = $wpdb->get_results( "SELECT option_name, option_value, autoload FROM {$wpdb->options} WHERE option_name LIKE 'msu\\_%'", ARRAY_A );
+
+		// Straight to MySQL: wpdb::query() would refuse some valid binary or serialized values.
+		$gz    = gzopen( $path, 'rb' );
+		$line  = '';
+		$error = '';
+		while ( $gz && ! gzeof( $gz ) ) {
+			$line .= (string) gzgets( $gz, 1048576 );
+			if ( "\n" !== substr( $line, -1 ) && ! gzeof( $gz ) ) {
+				continue; // Long INSERT: keep reading until the end of the line.
+			}
+			$sql  = trim( $line );
+			$line = '';
+			if ( '' !== $sql && 0 !== strpos( $sql, '--' ) && ! mysqli_query( $wpdb->dbh, $sql ) && ! $error ) {
+				$error = mysqli_error( $wpdb->dbh );
+			}
+		}
+		if ( $gz ) {
+			gzclose( $gz );
+		}
+		mysqli_query( $wpdb->dbh, 'SET foreign_key_checks = 1' );
+		$wpdb->set_charset( $wpdb->dbh );
+
+		foreach ( $keep as $row ) {
+			$wpdb->replace( $wpdb->options, $row );
+		}
+		wp_cache_flush();
+		if ( class_exists( '\Elementor\Plugin' ) && isset( \Elementor\Plugin::$instance->files_manager ) ) {
+			\Elementor\Plugin::$instance->files_manager->clear_cache();
+		}
+		if ( ! $gz || $error ) {
+			self::log( "Database put back from $file WITH ERRORS: " . ( $error ?: 'could not open the file' ) );
+			return new WP_Error( 'msu_restore_db', 'The database was only partly put back: ' . ( $error ?: 'could not open the file' ) );
+		}
+		self::log( 'Database put back as it was on ' . wp_date( 'Y-m-d H:i', filemtime( $path ) ) . '.' );
+		return true;
+	}
+
+	/** UpdraftPlus is no longer needed; if it is there, its last backup is still shown. [time, ok], or null without UpdraftPlus. */
+	public static function updraft_backup() {
 		$b = get_option( 'updraft_last_backup' );
 		if ( ! is_array( $b ) || empty( $b['backup_time'] ) ) {
-			return [ 'time' => 0, 'ok' => false ];
+			return null;
 		}
 		$files = $b['backup_array'] ?? [];
-		$ok    = ! empty( $b['success'] ) && isset( $files['db'], $files['plugins'] );
-		return [ 'time' => (int) $b['backup_time'], 'ok' => $ok ];
-	}
-
-	private static function backup_is_fresh() {
-		$b = self::last_backup();
-		return $b['ok'] && ( time() - $b['time'] ) < self::BACKUP_MAX_AGE;
-	}
-
-	/** Starts a full backup in its own background request, at most once every 6 hours. */
-	private static function request_backup( $reason ) {
-		if ( ! has_action( 'updraft_backupnow_backup_all' ) ) {
-			self::log( "Update waiting ($reason): UpdraftPlus is not active, so no backup can be made." );
-			self::alert_once( 'no-updraft', 'Updates are on hold: UpdraftPlus is not active', "Safe updates only install updates after a fresh backup, and UpdraftPlus (which makes the backups) is not active.\n\nReactivate UpdraftPlus to let updates resume." );
-			return;
-		}
-		$last = (int) get_option( 'msu_backup_requested', 0 );
-		if ( time() - $last < 6 * HOUR_IN_SECONDS ) {
-			if ( $last && time() - $last > 5 * HOUR_IN_SECONDS && ! self::backup_is_fresh() ) {
-				self::alert_once( 'backup-failing', 'Updates are on hold: the backup did not finish', "A backup was started before installing updates, but UpdraftPlus has not recorded a complete backup (database + plugins) since.\n\nOpen Settings > UpdraftPlus Backups to see what went wrong." );
-			}
-			return;
-		}
-		update_option( 'msu_backup_requested', time(), false );
-		wp_schedule_single_event( time() + 30, 'msu_run_backup' );
-		self::log( "Backup started before installing $reason. The update will run on WordPress's next update round (about 12 h)." );
+		return [ 'time' => (int) $b['backup_time'], 'ok' => ! empty( $b['success'] ) && isset( $files['db'], $files['plugins'] ) ];
 	}
 
 	/* ------------------------------------------------------------------ Copies of the previous version */
@@ -325,6 +461,9 @@ final class EgoWebDesign_Safe_Updates {
 		}
 
 		$version = self::installed_version( $type, $id );
+		if ( ! self::$in_run ) {
+			self::ensure_snapshot( self::item_name( $type, $id ) . ' update (by hand)' ); // Automatic updates took theirs already; this never blocks a manual one.
+		}
 		$fs      = self::fs();
 		$dest    = self::copies_dir() . '/' . $type . '-' . sanitize_file_name( 'plugin' === $type ? dirname( $id ) : $id );
 		if ( ! $fs || ! $version || ! is_dir( $src ) ) {
@@ -425,7 +564,7 @@ final class EgoWebDesign_Safe_Updates {
 
 		$check = self::run_checks();
 		if ( $check['ok'] ) {
-			self::mail( 'Updates installed, site checked OK', "These updates were installed automatically after a fresh backup:\n\n$list\n\nAll page checks passed." );
+			self::mail( 'Updates installed, site checked OK', "These updates were installed automatically after a database snapshot:\n\n$list\n\nAll page checks passed." );
 			return;
 		}
 
@@ -458,14 +597,16 @@ final class EgoWebDesign_Safe_Updates {
 			$back = implode( "\n", array_map( function ( $u ) { return "- {$u['name']} back to {$u['from']}"; }, $restored ) );
 			self::mail(
 				"Update undone: {$culprit['name']} {$culprit['to']} broke the site",
-				"These updates were installed automatically:\n\n$list\n\nAfter the update, the page checks failed. The previous version was put back and the site passes the checks again:\n\n$back\n\n{$culprit['name']} {$culprit['to']} will not be installed again automatically. The next version will be tried normally, or you can update by hand once the problem is understood.\n\nWhat failed before the fix:\n" . self::format_failures( self::$last_failures )
+				"These updates were installed automatically:\n\n$list\n\nAfter the update, the page checks failed. The previous version was put back and the site passes the checks again:\n\n$back\n\n{$culprit['name']} {$culprit['to']} will not be installed again automatically. The next version will be tried normally, or you can update by hand once the problem is understood.\n\nOnly the code was put back. If something still looks wrong (an update can also change the database), the database snapshot taken just before can be put back from Dashboard > Safe updates.\n\nWhat failed before the fix:\n" . self::format_failures( self::$last_failures )
 			);
 		} else {
-			$b = self::last_backup();
+			$snap = self::snapshots()[0] ?? null;
+			$b    = self::updraft_backup();
 			self::mail(
 				'URGENT: the site has a problem after updates',
 				"These updates were installed automatically:\n\n$list\n\nThe page checks fail, and putting back the previous versions did not fix it" . ( $restored ? '' : ' (no saved copy could be used)' ) . ".\n\nWhat fails:\n" . self::format_failures( $check['failures'] ) .
-				"\n\nTo restore the whole site, use the UpdraftPlus backup from " . ( $b['time'] ? wp_date( 'Y-m-d H:i', $b['time'] ) : '(none found)' ) . ' (Settings > UpdraftPlus Backups > Restore).'
+				"\n\nThe database snapshot from " . ( $snap ? wp_date( 'Y-m-d H:i', $snap['time'] ) : '(none found)' ) . ' can be put back from Dashboard > Safe updates (anything saved since will be lost).' .
+				( $b ? "\nThere is also an UpdraftPlus backup from " . wp_date( 'Y-m-d H:i', $b['time'] ) . ' (Settings > UpdraftPlus Backups > Restore).' : '' )
 			);
 		}
 	}
@@ -688,7 +829,8 @@ final class EgoWebDesign_Safe_Updates {
 		}
 
 		$c    = get_option( 'msu_last_check', [] );
-		$b    = self::last_backup();
+		$snap = self::snapshots()[0] ?? null;
+		$b    = self::updraft_backup();
 		$seen = get_option( 'msu_seen', [] );
 		$held = [];
 		foreach ( $seen as $k => $sv ) {
@@ -723,8 +865,10 @@ final class EgoWebDesign_Safe_Updates {
 				'page_checks' => empty( $c['time'] ) ? 'not-run' : ( $c['ok'] ? 'ok' : 'problem' ),
 				'checked'     => $fmt( $c['time'] ?? 0 ),
 				'failing'     => array_keys( $c['failures'] ?? [] ),
-				'last_backup' => $fmt( $b['time'] ),
-				'backup_ok'   => $b['ok'],
+				'last_backup' => $fmt( $snap['time'] ?? 0 ), // The database snapshot updates rely on (was UpdraftPlus before 2.3).
+				'backup_ok'   => (bool) $snap,
+				'snapshot'    => $snap ? [ 'time' => $fmt( $snap['time'] ), 'size' => $snap['size'] ] : null,
+				'updraftplus' => $b ? [ 'time' => $fmt( $b['time'] ), 'ok' => $b['ok'] ] : null,
 				'held'        => $held,
 				'blocked'     => $blocked,
 			],
@@ -766,13 +910,12 @@ final class EgoWebDesign_Safe_Updates {
 	/** One line that sums up the site: [level ok|warning|error, headline]. Worst problem wins. */
 	private static function overall() {
 		$c = get_option( 'msu_last_check', [] );
-		$b = self::last_backup();
 		if ( ! empty( $c['time'] ) && ! $c['ok'] ) {
 			$n = count( $c['failures'] );
 			return [ 'error', $n > 1 ? "$n checks fail" : 'A check fails' ];
 		}
-		if ( ! class_exists( 'UpdraftPlus' ) && ! has_action( 'updraft_backupnow_backup_all' ) ) {
-			return [ 'warning', 'Updates on hold: UpdraftPlus is not active' ];
+		if ( get_transient( 'msu_alert_snapshot-failing' ) ) {
+			return [ 'warning', 'Updates on hold: the database snapshot failed' ];
 		}
 		if ( empty( $c['time'] ) ) {
 			return [ 'warning', 'Page checks have not run yet' ];
@@ -780,16 +923,14 @@ final class EgoWebDesign_Safe_Updates {
 		if ( time() - $c['time'] > self::STALE_CHECK ) {
 			return [ 'warning', 'Page checks have stopped running' ];
 		}
-		if ( ! $b['time'] ) {
-			return [ 'warning', 'No complete backup yet' ];
-		}
 		return [ 'ok', 'Site OK' ];
 	}
 
 	/** Status headline and the key facts, shared by the dashboard box and the Overview tab. */
 	private static function render_summary() {
 		$c       = get_option( 'msu_last_check', [] );
-		$b       = self::last_backup();
+		$snap    = self::snapshots()[0] ?? null;
+		$b       = self::updraft_backup();
 		$held    = self::held();
 		$blocked = get_option( 'msu_blocked', [] );
 		$next    = wp_next_scheduled( 'msu_check' );
@@ -817,7 +958,10 @@ final class EgoWebDesign_Safe_Updates {
 		}
 		echo '</dd>';
 
-		echo '<dt>Last backup</dt><dd>' . ( $b['time'] ? self::ago( $b['time'] ) . ( $b['ok'] ? '' : ' <span class="msu-warn">incomplete</span>' ) : 'None found' ) . '</dd>';
+		echo '<dt>Database snapshot</dt><dd>' . ( $snap ? self::ago( $snap['time'] ) . ' <span class="msu-muted">' . esc_html( size_format( $snap['size'] ) ) . '</span>' : 'None yet <span class="msu-muted">saved before each update</span>' ) . '</dd>';
+		if ( $b ) {
+			echo '<dt>UpdraftPlus</dt><dd>' . self::ago( $b['time'] ) . ( $b['ok'] ? '' : ' <span class="msu-warn">incomplete</span>' ) . ' <span class="msu-muted">not needed for updates</span></dd>';
+		}
 
 		if ( $held ) {
 			echo '<dt>On hold</dt><dd><ul class="msu-list">';
@@ -855,6 +999,17 @@ final class EgoWebDesign_Safe_Updates {
 		foreach ( $copies as $key => $copy ) {
 			echo '<tr><td><strong>' . esc_html( $copy['name'] ) . '</strong> ' . esc_html( $copy['version'] ) . '</td><td class="msu-muted">saved ' . self::ago( $copy['time'] ) . '</td><td class="msu-end">';
 			self::action_button( 'msu_restore', 'Put back', [ 'key' => $key ], 'button button-small', "Put back {$copy['name']} {$copy['version']}? The version installed now will be replaced.", 'Putting back…' );
+			echo '</td></tr>';
+		}
+		echo '</tbody></table>';
+	}
+
+	private static function render_snapshots() {
+		echo '<table class="msu-table"><tbody>';
+		foreach ( self::snapshots() as $snap ) {
+			$when = wp_date( 'Y-m-d H:i', $snap['time'] );
+			echo '<tr><td><strong>' . esc_html( $when ) . '</strong> <span class="msu-muted">' . esc_html( size_format( $snap['size'] ) ) . '</span></td><td class="msu-muted">' . self::ago( $snap['time'] ) . '</td><td class="msu-end">';
+			self::action_button( 'msu_restore_db', 'Put back', [ 'file' => $snap['file'] ], 'button button-small', "Put back the whole database as it was on $when? Everything saved since then (pages, form entries, orders, settings) will be lost.", 'Putting back…' );
 			echo '</td></tr>';
 		}
 		echo '</tbody></table>';
@@ -986,6 +1141,11 @@ document.addEventListener('click', function (e) {
 			self::render_copies( $copies );
 			echo '</details>';
 		}
+		if ( current_user_can( 'manage_options' ) && self::snapshots() ) {
+			echo '<details class="msu-more"><summary>Database snapshots (' . count( self::snapshots() ) . ')</summary>';
+			self::render_snapshots();
+			echo '</details>';
+		}
 		if ( $log ) {
 			echo '<details class="msu-more"><summary>Recent activity</summary>';
 			self::render_log( $log );
@@ -1026,7 +1186,7 @@ document.addEventListener('click', function (e) {
 		self::render_summary();
 		echo '<div class="msu-actions">';
 		self::action_button( 'msu_check_now', 'Run checks now', [], 'button', '', 'Checking…' );
-		echo '<span class="msu-muted">Updates install only after a backup from the last ' . esc_html( self::BACKUP_MAX_AGE / HOUR_IN_SECONDS ) . ' h. Big releases wait ' . esc_html( self::HOLD_DAYS ) . ' days.</span></div></div>';
+		echo '<span class="msu-muted">Updates install right after a database snapshot. Big releases wait ' . esc_html( self::HOLD_DAYS ) . ' days.</span></div></div>';
 
 		echo '<div class="card"><h2>Previous versions</h2><p class="description">A copy of each plugin and theme is kept just before it updates. If an update breaks the site, it is put back automatically.</p>';
 		if ( $copies ) {
@@ -1035,6 +1195,16 @@ document.addEventListener('click', function (e) {
 			echo '<p class="msu-muted">No copies yet. One is saved at the next update.</p>';
 		}
 		echo '</div>';
+
+		echo '<div class="card"><h2>Database snapshots</h2><p class="description">The database is saved just before updates install (the last ' . esc_html( self::SNAPSHOTS_KEPT ) . ' are kept). Putting one back undoes everything saved since, so it is never done automatically.</p>';
+		if ( self::snapshots() ) {
+			self::render_snapshots();
+		} else {
+			echo '<p class="msu-muted">None yet. One is saved at the next update.</p>';
+		}
+		echo '<div class="msu-actions">';
+		self::action_button( 'msu_snapshot_now', 'Save a snapshot now', [], 'button', '', 'Saving…' );
+		echo '</div></div>';
 
 		echo '<div class="card"><h2>Activity</h2><p class="description">The last ' . count( $log ) . ' events.</p>';
 		if ( $log ) {
@@ -1143,6 +1313,11 @@ document.addEventListener('click', function (e) {
 			'restored-ko' => [ 'warning', "$item is back, but page checks still fail." ],
 			'restore-failed' => [ 'error', "Could not put the previous version back: $item" ],
 			'unblocked' => [ 'success', "$item can update automatically again." ],
+			'snapshot-saved'  => [ 'success', 'Database snapshot saved.' ],
+			'snapshot-failed' => [ 'error', "The database snapshot failed: $item" ],
+			'db-restored'     => [ 'success', "Database put back as it was on $item. Page checks pass." ],
+			'db-restored-ko'  => [ 'warning', "Database put back as it was on $item, but page checks still fail." ],
+			'db-restore-failed' => [ 'error', "Could not put the database back: $item" ],
 		];
 		$code = sanitize_key( $_GET['msu_notice'] );
 		if ( isset( $messages[ $code ] ) ) {
@@ -1229,6 +1404,33 @@ document.addEventListener('click', function (e) {
 		update_option( 'msu_blocked', $blocked, false );
 		self::log( "$name allowed to update automatically again." );
 		self::back( 'unblocked', $name );
+	}
+
+	public static function admin_snapshot_now() {
+		check_admin_referer( 'msu_snapshot_now' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$res = self::take_snapshot( 'a manual request' );
+		if ( is_wp_error( $res ) ) {
+			self::back( 'snapshot-failed', $res->get_error_message() );
+		}
+		self::back( 'snapshot-saved' );
+	}
+
+	public static function admin_restore_db() {
+		check_admin_referer( 'msu_restore_db' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$file = sanitize_file_name( wp_unslash( $_POST['file'] ?? '' ) );
+		$snap = wp_list_filter( self::snapshots(), [ 'file' => $file ] );
+		$when = $snap ? wp_date( 'Y-m-d H:i', reset( $snap )['time'] ) : $file;
+		$res  = self::restore_snapshot( $file );
+		if ( is_wp_error( $res ) ) {
+			self::back( 'db-restore-failed', $res->get_error_message() );
+		}
+		self::back( self::run_checks()['ok'] ? 'db-restored' : 'db-restored-ko', $when );
 	}
 
 	/* ------------------------------------------------------------------ Log and email */
