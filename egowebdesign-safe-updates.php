@@ -2,7 +2,7 @@
 /**
  * Plugin Name: EgoWebDesign – Safe updates
  * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Watches for signs of intrusion: new administrators, changed core files, unexpected PHP files. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
- * Version: 2.4.0
+ * Version: 2.5.0
  * Author: EgoWebDesign
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
@@ -12,13 +12,14 @@ defined( 'ABSPATH' ) || exit;
 
 final class EgoWebDesign_Safe_Updates {
 
-	const VERSION        = '2.4.0';
+	const VERSION        = '2.5.0';
 	const REPO           = 'choikib/egowebdesign-safe-updates'; // New versions = tags "vX.Y.Z" on this public GitHub repo.
 	const DEFAULT_EMAIL  = 'veronneau.mathieu@gmail.com';
 	const HOLD_DAYS      = 7;                     // Big releases (x.Y changes) wait this long before installing.
 	const SNAPSHOT_MAX_AGE = HOUR_IN_SECONDS;     // Updates need a database snapshot at most this old (one is taken on the spot).
 	const SNAPSHOTS_KEPT = 3;
 	const STALE_CHECK    = 36 * HOUR_IN_SECONDS;  // The status page reports a problem if checks stop running.
+	const REGISTRY       = 'https://egowebdesign.ca/msu-watch/register.php'; // Where sites sign up for monitoring (Settings > Safe updates can turn it off).
 
 	/** True while WordPress's automatic updater is running (not when an admin looks at the Plugins screen). */
 	private static $in_run = false;
@@ -33,6 +34,7 @@ final class EgoWebDesign_Safe_Updates {
 			'label'   => wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ),
 			'pages'   => "Accueil | / |",
 			'markers' => "</html> | page is cut off",
+			'register' => 1,
 		] );
 	}
 
@@ -48,6 +50,50 @@ final class EgoWebDesign_Safe_Updates {
 		wp_clear_scheduled_hook( 'msu_run_backup' );
 		delete_option( 'msu_backup_requested' );
 		update_option( 'msu_version', self::VERSION, false );
+		self::schedule_register(); // Installed or updated: sign up / refresh the details in a minute, in the background.
+	}
+
+	/* ------------------------------------------------------------------ Monitoring sign-up */
+
+	private static function schedule_register() {
+		if ( ! wp_next_scheduled( 'msu_register' ) ) {
+			wp_schedule_single_event( time() + MINUTE_IN_SECONDS, 'msu_register' );
+		}
+	}
+
+	/**
+	 * Signs this site up with the EgoWebDesign watcher, or refreshes its details there (name, report link, version).
+	 * The watcher checks the report link really answers for this site; a new site is monitored once EgoWebDesign approves it.
+	 */
+	public static function register_site() {
+		if ( empty( self::settings()['register'] ) ) {
+			return;
+		}
+		$res    = wp_remote_post( self::REGISTRY, [
+			'timeout' => 45,
+			'headers' => [ 'Content-Type' => 'application/json' ],
+			'body'    => wp_json_encode( [
+				'url'        => home_url( '/' ),
+				'name'       => wp_specialchars_decode( get_bloginfo( 'name' ), ENT_QUOTES ),
+				'report_url' => self::report_url(),
+				'version'    => self::VERSION,
+			] ),
+		] );
+		$body   = is_wp_error( $res ) ? [] : (array) json_decode( wp_remote_retrieve_body( $res ), true );
+		$status = $body['status'] ?? ( is_wp_error( $res ) ? $res->get_error_message() : ( $body['error'] ?? 'HTTP ' . wp_remote_retrieve_response_code( $res ) ) );
+		$prev   = get_option( 'msu_registry', [] );
+		update_option( 'msu_registry', [ 'time' => time(), 'ok' => isset( $body['status'] ), 'status' => $status ], false );
+		if ( ( $prev['status'] ?? '' ) !== $status ) {
+			self::log( 'Monitoring sign-up: ' . self::registry_label( $status ) . '.' );
+		}
+	}
+
+	private static function registry_label( $status ) {
+		return [
+			'approved' => 'monitored by EgoWebDesign',
+			'pending'  => 'waiting for EgoWebDesign to approve it',
+			'ignored'  => 'declined by EgoWebDesign, not monitored',
+		][ $status ] ?? "could not sign up ($status)";
 	}
 
 	/** Pages checked after every update and twice a day: [label, path, [markers that page must contain]]. */
@@ -99,6 +145,7 @@ final class EgoWebDesign_Safe_Updates {
 		add_action( 'upgrader_process_complete', [ __CLASS__, 'after_manual_update' ], 10, 2 );
 
 		add_action( 'msu_check', [ __CLASS__, 'scheduled_check' ] );
+		add_action( 'msu_register', [ __CLASS__, 'register_site' ] );
 		add_action( 'init', function () {
 			if ( ! wp_next_scheduled( 'msu_check' ) ) {
 				wp_schedule_event( time() + HOUR_IN_SECONDS, 'twicedaily', 'msu_check' );
@@ -729,6 +776,9 @@ final class EgoWebDesign_Safe_Updates {
 			self::mail( 'Website OK again', 'The page checks pass again.' );
 		}
 		self::security_scan();
+		if ( time() - ( get_option( 'msu_registry', [] )['time'] ?? 0 ) > DAY_IN_SECONDS - HOUR_IN_SECONDS ) {
+			self::register_site(); // Once a day, so the watcher always has the current report link.
+		}
 	}
 
 	private static function format_failures( $failures ) {
@@ -1639,6 +1689,14 @@ document.addEventListener('click', function (e) {
 		echo '<tr><th scope="row"><label for="msu-label">Site name in subjects</label></th><td><input id="msu-label" name="label" type="text" class="regular-text" value="' . esc_attr( $s['label'] ) . '"><p class="description">Subjects look like <code>[' . esc_html( $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST ) ) . '] Problem detected on the website</code></p></td></tr>';
 		echo '</table></div>';
 
+		$reg = get_option( 'msu_registry', [] );
+		echo '<div class="card"><h2>EgoWebDesign monitoring</h2><p class="description">Once a day, this site sends its name, address and private report link to egowebdesign.ca, so EgoWebDesign can watch it every 5 minutes and show it on the monitoring dashboard. A new site is monitored only once EgoWebDesign approves it.</p>';
+		echo '<p><label><input type="checkbox" name="register" value="1"' . checked( ! empty( $s['register'] ), true, false ) . '> Sign up this site for monitoring</label></p>';
+		if ( ! empty( $reg['time'] ) ) {
+			echo '<p class="msu-muted">' . esc_html( ucfirst( self::registry_label( $reg['status'] ) ) ) . ' · last contact ' . self::ago( $reg['time'] ) . '</p>';
+		}
+		echo '</div>';
+
 		echo '<div class="msu-form-actions">';
 		submit_button( 'Save changes', 'primary', 'submit', false );
 		echo '</div></form>';
@@ -1651,7 +1709,7 @@ document.addEventListener('click', function (e) {
 		self::action_button( 'msu_new_key', 'Make a new link', [], 'button-link button-link-delete', 'The current link will stop working right away. Continue?' );
 		echo '<span class="msu-muted">Use this if the link was shared by mistake.</span></div></div>';
 
-		echo '<div class="card"><h2>Status link</h2><p class="description">For the EgoWebDesign watcher, which checks it every 5 minutes and emails when the site goes down or comes back. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running. To watch this site, add it to the watcher\'s list.</p>';
+		echo '<div class="card"><h2>Status link</h2><p class="description">For the EgoWebDesign watcher, which checks it every 5 minutes and emails when the site goes down or comes back. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running. The site signs up for this on its own (Settings tab).</p>';
 		echo '<div class="msu-field"><input id="msu-status" type="text" readonly class="code" value="' . esc_attr( rest_url( 'egowebdesign/v1/status' ) ) . '"><button type="button" class="button" data-msu-copy="msu-status">Copy</button></div></div>';
 	}
 
@@ -1671,7 +1729,7 @@ document.addEventListener('click', function (e) {
 		$item     = sanitize_text_field( wp_unslash( $_GET['msu_item'] ?? '' ) );
 		$messages = [
 			'saved'     => [ 'success', 'Settings saved.' ],
-			'new-key'   => [ 'success', 'New report link made. Update it in the monitoring dashboard.' ],
+			'new-key'   => [ 'success', 'New report link made. The monitoring gets it within a few minutes.' ],
 			'checks-ok' => [ 'success', 'Page checks pass.' ],
 			'checks-ko' => [ 'error', 'Page checks found a problem. Details are in the Safe updates box.' ],
 			'restored'  => [ 'success', "$item is back. Page checks pass." ],
@@ -1724,7 +1782,11 @@ document.addEventListener('click', function (e) {
 				return $row;
 			} ),
 			'markers' => $lines( $in['markers'] ?? [], 0 ),
+			'register' => empty( $in['register'] ) ? 0 : 1,
 		], false );
+		if ( ! empty( $in['register'] ) ) {
+			self::schedule_register();
+		}
 		self::back( 'saved' );
 	}
 
@@ -1734,6 +1796,7 @@ document.addEventListener('click', function (e) {
 			wp_die( 'Not allowed.' );
 		}
 		update_option( 'msu_report_key', wp_generate_password( 32, false ), false );
+		self::schedule_register(); // The watcher and the dashboard get the new link.
 		self::back( 'new-key' );
 	}
 
