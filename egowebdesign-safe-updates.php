@@ -24,6 +24,9 @@ final class EgoWebDesign_Safe_Updates {
 	/** True while WordPress's automatic updater is running (not when an admin looks at the Plugins screen). */
 	private static $in_run = false;
 
+	/** WordPress version when the automatic updater started (to tell a big core release from a small one afterwards). */
+	private static $core_before = '';
+
 	/* ------------------------------------------------------------------ Settings */
 
 	/** Settings with their defaults. Stored in one option, edited at Settings > Safe updates. */
@@ -135,7 +138,10 @@ final class EgoWebDesign_Safe_Updates {
 			return $links;
 		} );
 
-		add_action( 'wp_maybe_auto_update', function () { self::$in_run = true; }, 1 );
+		add_action( 'wp_maybe_auto_update', function () {
+			self::$in_run      = true;
+			self::$core_before = get_bloginfo( 'version' );
+		}, 1 );
 
 		foreach ( [ 'plugin', 'theme', 'core' ] as $type ) {
 			add_filter( "auto_update_{$type}", function ( $update, $item ) use ( $type ) {
@@ -146,6 +152,14 @@ final class EgoWebDesign_Safe_Updates {
 		add_filter( 'upgrader_pre_install', [ __CLASS__, 'save_copy' ], 10, 2 );
 		add_action( 'automatic_updates_complete', [ __CLASS__, 'after_auto_updates' ] );
 		add_action( 'upgrader_process_complete', [ __CLASS__, 'after_manual_update' ], 10, 2 );
+		add_filter( 'auto_plugin_theme_update_email', [ __CLASS__, 'plugin_theme_update_email' ], 10, 4 );
+		add_filter( 'auto_core_update_email', [ __CLASS__, 'core_update_email' ], 10, 4 );
+		// Small updates that worked only go in the Monday summary: WordPress emails failures and big releases only.
+		add_filter( 'auto_plugin_update_send_email', [ __CLASS__, 'send_update_email' ], 10, 2 );
+		add_filter( 'auto_theme_update_send_email', [ __CLASS__, 'send_update_email' ], 10, 2 );
+		add_filter( 'auto_core_update_send_email', function ( $send, $type ) {
+			return $send && ( 'success' !== $type || ( self::$core_before && self::is_major( self::$core_before, get_bloginfo( 'version' ) ) ) );
+		}, 10, 2 );
 
 		add_action( 'msu_check', [ __CLASS__, 'scheduled_check' ] );
 		add_action( 'msu_register', [ __CLASS__, 'register_site' ] );
@@ -2110,6 +2124,16 @@ document.addEventListener('click', function (e) {
 	 *     facts_last (facts after the lists), note, button [label, url], footer.
 	 */
 	private static function mail_html( $subject, $m ) {
+		list( $html, $text, $site ) = self::mail_parts( $m );
+		$alt = function ( $mailer ) use ( $text ) { $mailer->AltBody = $text; };
+		add_action( 'phpmailer_init', $alt );
+		$sent = wp_mail( self::settings()['email'], "[$site] $subject", $html, [ 'Content-Type: text/html; charset=UTF-8' ] );
+		remove_action( 'phpmailer_init', $alt );
+		return $sent;
+	}
+
+	/** [html, plain text, site label] of an email, see mail_html(). */
+	private static function mail_parts( $m ) {
 		$s    = self::settings();
 		$site = $s['label'] ?: wp_parse_url( home_url(), PHP_URL_HOST );
 		$e    = function ( $v ) { return esc_html( (string) $v ); };
@@ -2184,11 +2208,90 @@ document.addEventListener('click', function (e) {
 			. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">' . $e( home_url( '/' ) ) . ' · ' . $e( $footer ) . '</td></tr>'
 			. '</table></td></tr></table></body></html>';
 
-		$alt = function ( $mailer ) use ( $text ) { $mailer->AltBody = $text; };
+		return [ $html, $text, $site ];
+	}
+
+	/** WordPress's email about automatic plugin (or theme) updates: only when one failed or one was a big release. */
+	public static function send_update_email( $send, $results ) {
+		foreach ( $results as $r ) {
+			if ( ! $r->result || is_wp_error( $r->result ) || ( ! empty( $r->item->current_version ) && self::is_major( $r->item->current_version, $r->item->new_version ) ) ) {
+				return $send;
+			}
+		}
+		return false;
+	}
+
+	/** WordPress's own email after automatic plugin/theme updates, in the same design. It is sent before the page checks run. */
+	public static function plugin_theme_update_email( $email, $type, $successful, $failed ) {
+		$ok     = count( $successful['plugin'] ?? [] ) + count( $successful['theme'] ?? [] );
+		$ko     = count( $failed['plugin'] ?? [] ) + count( $failed['theme'] ?? [] );
+		$groups = [];
+		foreach ( [ 'plugin' => 'Plugins', 'theme' => 'Themes' ] as $kind => $label ) {
+			$groups[] = [ "$label updated", array_map( function ( $i ) {
+				return [ html_entity_decode( $i->name ), ( empty( $i->item->current_version ) ? '' : "{$i->item->current_version} → " ) . $i->item->new_version ];
+			}, $successful[ $kind ] ?? [] ) ];
+		}
+		foreach ( [ 'plugin' => 'Plugins', 'theme' => 'Themes' ] as $kind => $label ) {
+			$groups[] = [ "$label not updated", array_map( function ( $i ) {
+				return [ html_entity_decode( $i->name ), ( empty( $i->item->current_version ) ? '' : "Still on {$i->item->current_version}, " ) . "{$i->item->new_version} could not be installed" ];
+			}, $failed[ $kind ] ?? [] ) ];
+		}
+		$installed = 1 === $ok ? '1 update installed' : "$ok updates installed";
+		$failures  = 1 === $ko ? '1 update failed' : "$ko updates failed";
+		$snap      = self::snapshots()[0] ?? null;
+		$m         = [
+			'groups' => $groups,
+			'facts'  => $ok ? [ [ 'Database snapshot', $snap ? self::email_date( $snap['time'] ) : 'none found' ] ] : [],
+			'facts_last' => true,
+			'button' => [ 'Open Updates', admin_url( 'update-core.php' ) ],
+		];
+		if ( 'success' === $type ) {
+			$m += [ 'tone' => 'green', 'badge' => 'Updated', 'title' => $installed, 'lead' => 'WordPress installed these updates automatically. Safe updates now checks the pages and emails you right away if something broke.' ];
+		} elseif ( 'fail' === $type ) {
+			$m += [ 'tone' => 'red', 'badge' => 'Update failed', 'title' => $failures, 'lead' => 'WordPress tried to install these updates automatically and could not. The previous versions are still in place; WordPress tries again later, or you can update from Dashboard > Updates.' ];
+		} else {
+			$m += [ 'tone' => 'amber', 'badge' => 'Partly updated', 'title' => "$installed, $ko failed", 'lead' => 'WordPress installed some updates automatically, others could not be installed (their previous versions are still in place). Safe updates now checks the pages and emails you right away if something broke.' ];
+		}
+		return self::restyle_wp_email( $email, $m['title'], $m );
+	}
+
+	/** WordPress's own email about a core update (installed, failed, needs a manual update, or broke midway), in the same design. */
+	public static function core_update_email( $email, $type, $core_update, $result ) {
+		$next  = get_preferred_from_update_core() ?: $core_update;
+		$v     = version_compare( $next->current, $core_update->current, '>' ) ? $next->current : $core_update->current; // Like WordPress: a newer release than the one tried, if any.
+		$facts = is_wp_error( $result ) ? [ [ 'Error', $result->get_error_message() ] ] : [];
+		$m     = [
+			'success'  => [ 'green', 'Updated', "WordPress $v installed", "The site was updated automatically to WordPress $v. Safe updates now checks the pages and emails you right away if something broke." ],
+			'fail'     => [ 'amber', 'Update failed', "WordPress $v could not be installed", 'WordPress tried to update automatically and could not, so the site is still on WordPress ' . get_bloginfo( 'version' ) . '. It tries again later, or you can update from Dashboard > Updates.' ],
+			'manual'   => [ 'blue', 'Update available', "WordPress $v is available", 'This site cannot install it automatically. Update from Dashboard > Updates.' ],
+			'critical' => [ 'red', 'Urgent', 'The site may be down after a failed WordPress update', "The update to WordPress $v started copying files, then failed. Someone needs to look at the site now." ],
+		][ $type ] ?? null;
+		if ( ! $m ) {
+			return $email;
+		}
+		return self::restyle_wp_email( $email, $m[2], [
+			'tone'   => $m[0],
+			'badge'  => $m[1],
+			'title'  => $m[2],
+			'lead'   => $m[3],
+			'facts'  => $facts,
+			'button' => [ 'Open Updates', admin_url( 'update-core.php' ) ],
+		] );
+	}
+
+	/** Swaps a WordPress email's subject and body for ours; the recipient stays WordPress's. */
+	private static function restyle_wp_email( $email, $subject, $m ) {
+		list( $html, $text, $site ) = self::mail_parts( $m );
+		$alt = function ( $mailer ) use ( $text, &$alt ) {
+			$mailer->AltBody = $text;
+			remove_action( 'phpmailer_init', $alt );
+		};
 		add_action( 'phpmailer_init', $alt );
-		$sent = wp_mail( $s['email'], "[$site] $subject", $html, [ 'Content-Type: text/html; charset=UTF-8' ] );
-		remove_action( 'phpmailer_init', $alt );
-		return $sent;
+		return array_merge( $email, [
+			'subject' => "[$site] $subject",
+			'body'    => $html,
+			'headers' => [ 'Content-Type: text/html; charset=UTF-8' ],
+		] );
 	}
 
 	/** The same alert at most once a day. */
