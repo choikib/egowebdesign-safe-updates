@@ -2,3 +2,4 @@
 README.md export-ignore
 release.sh export-ignore
 .gitattributes export-ignore
+watcher/ export-ignore

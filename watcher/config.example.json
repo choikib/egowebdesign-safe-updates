@@ -1,0 +1,9 @@
+{
+	"email": "you@example.com",
+	"from": "watcher@example.com",
+	"public_file": "/home/USER/public_html/msu-watch/RANDOM.json",
+	"sites": [
+		{ "name": "Example", "url": "https://example.com" },
+		{ "name": "Example dev", "url": "https://example.com/dev" }
+	]
+}
