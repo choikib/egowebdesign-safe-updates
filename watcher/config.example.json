@@ -2,8 +2,9 @@
 	"email": "you@example.com",
 	"from": "watcher@example.com",
 	"public_file": "/home/USER/public_html/msu-watch/RANDOM.json",
+	"sites_file": "/home/USER/public_html/msu-watch/OTHER-RANDOM.json",
+	"approve_url": "https://example.com/msu-watch/approve.php",
 	"sites": [
-		{ "name": "Example", "url": "https://example.com" },
-		{ "name": "Example dev", "url": "https://example.com/dev" }
+		{ "name": "Example", "url": "https://example.com" }
 	]
 }

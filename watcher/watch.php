@@ -6,9 +6,15 @@
  * (and every 6 h while it stays down), and writes a JSON summary (states, 30-day uptime, incidents)
  * for the monitoring dashboard. Settings in config.json next to this file (see config.example.json).
  *
+ * Sites to watch: the ones in config.json, plus those that signed up (public/register.php) and were
+ * approved (public/approve.php). The approved list, with each site's report link, is also written for
+ * the dashboard's daily routine (config.json "sites_file").
+ *
  * php watch.php           normal run (cron)
  * php watch.php --test    sends a test email, changes nothing
  */
+
+require __DIR__ . '/lib.php';
 
 const REMIND_EVERY = 6 * 3600;  // Repeat the alert this often while a site stays down.
 const RETRY_AFTER  = 20;        // Seconds before re-checking a site that failed, to rule out a blip.
@@ -16,13 +22,11 @@ const KEEP_DAYS    = 90;        // Incidents older than this are dropped.
 const UPTIME_DAYS  = 30;
 
 $dir  = __DIR__;
-$conf = json_decode( (string) @file_get_contents( "$dir/config.json" ), true );
-if ( ! $conf || empty( $conf['sites'] ) || empty( $conf['email'] ) ) {
+$conf = load_conf();
+if ( ! $conf || ! $conf['sites'] ) {
 	fwrite( STDERR, "config.json missing or incomplete\n" );
 	exit( 1 );
 }
-
-date_default_timezone_set( $conf['timezone'] ?? 'America/Toronto' ); // Times in emails.
 
 if ( in_array( '--test', $argv, true ) ) {
 	$state = json_decode( (string) @file_get_contents( "$dir/state.json" ), true ) ?: [ 'sites' => [] ];
@@ -97,7 +101,7 @@ foreach ( $alerts as $a ) {
 	alert( $conf, $a[0], $a[1], $a[2], $state['sites'] );
 }
 
-// Sites removed from config.json: forget them and close what was open.
+// Sites no longer watched: forget them and close what was open.
 foreach ( array_diff( array_keys( $state['sites'] ), array_column( $conf['sites'], 'url' ) ) as $gone ) {
 	close_incident( $incidents, $gone, $now );
 	unset( $state['sites'][ $gone ] );
@@ -108,6 +112,9 @@ $state['last_run'] = $now;
 save( "$dir/state.json", $state );
 if ( ! empty( $conf['public_file'] ) ) {
 	save( $conf['public_file'], summary( $conf, $state, $now ) );
+}
+if ( ! empty( $conf['sites_file'] ) ) {
+	save( $conf['sites_file'], sites_list( $conf, $now ) );
 }
 
 /* ------------------------------------------------------------------ */
@@ -222,74 +229,8 @@ function alert_parts( $conf, $kind, $site, $res, $all ) {
 	return [ "[Safe updates] $prefix" . ( 'test' === $kind ? 'Watcher test' : ( $prefix ? $name : $title ) ), $text, email_html( $conf, compact( 'badge', 'title', 'lead', 'accent', 'tint', 'rows', 'button' ), $all ) ];
 }
 
-function state_label( $state ) {
-	return [ 'ok' => 'OK', 'problem' => 'Problem', 'down' => 'Down' ][ $state ] ?? 'Not checked yet';
-}
 
-function when( $t ) {
-	return date( 'M j, H:i', $t );
-}
 
-/** Table layout and inline styles only: what Gmail, Outlook and Apple Mail all render. */
-function email_html( $conf, $m, $all ) {
-	$e    = function ( $s ) { return htmlspecialchars( (string) $s, ENT_QUOTES, 'UTF-8' ); };
-	$font = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
-	$dot  = [ 'ok' => '#12B76A', 'problem' => '#F79009', 'down' => '#F04438' ];
-
-	$rows = '';
-	foreach ( $m['rows'] as $r ) {
-		$value = preg_match( '#^https?://#', $r[1] ) ? '<a href="' . $e( $r[1] ) . '" style="color:#1F4FD8;text-decoration:none;">' . $e( preg_replace( '#^https?://#', '', $r[1] ) ) . '</a>' : $e( $r[1] );
-		$rows .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#667085;font-size:13px;width:120px;vertical-align:top;">' . $e( $r[0] ) . '</td>'
-			. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#101828;font-size:14px;vertical-align:top;">' . $value . '</td></tr>';
-	}
-
-	$button = '';
-	if ( $m['button'] ) {
-		$button = '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:24px 0 4px;"><tr><td style="border-radius:8px;background:' . $m['accent'] . ';">'
-			. '<a href="' . $e( $m['button'][1] ) . '" style="' . $font . 'display:inline-block;padding:12px 20px;font-size:14px;font-weight:600;color:#FFFFFF;text-decoration:none;border-radius:8px;">' . $e( $m['button'][0] ) . ' &rarr;</a></td></tr></table>';
-	}
-
-	$sites = '';
-	foreach ( $conf['sites'] as $s ) {
-		$st     = $all[ $s['url'] ]['state'] ?? null;
-		$sites .= '<tr><td style="' . $font . 'padding:8px 0;font-size:14px;color:#101828;">'
-			. '<span style="display:inline-block;width:8px;height:8px;border-radius:4px;background:' . ( $dot[ $st ] ?? '#98A2B3' ) . ';margin-right:10px;vertical-align:middle;"></span>' . $e( $s['name'] ) . '</td>'
-			. '<td align="right" style="' . $font . 'padding:8px 0;font-size:13px;color:' . ( 'ok' === $st ? '#667085' : ( $dot[ $st ] ?? '#98A2B3' ) ) . ';font-weight:' . ( 'ok' === $st ? '400' : '600' ) . ';">' . $e( state_label( $st ) ) . '</td></tr>';
-	}
-
-	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light"><title>' . $e( $m['title'] ) . '</title></head>'
-		. '<body style="margin:0;padding:0;background:#F2F4F7;">'
-		. '<div style="display:none;max-height:0;overflow:hidden;">' . $e( $m['lead'] ) . '</div>'
-		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F4F7;"><tr><td align="center" style="padding:32px 16px;">'
-		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">'
-
-		// Brand line
-		. '<tr><td style="' . $font . 'padding:0 4px 14px;font-size:13px;color:#475467;">'
-		. '<span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:6px;background:#101828;color:#FFFFFF;font-size:12px;font-weight:700;vertical-align:middle;margin-right:8px;">S</span>'
-		. '<span style="vertical-align:middle;font-weight:600;color:#101828;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; Watcher</span></td></tr>'
-
-		// Card
-		. '<tr><td style="background:#FFFFFF;border:1px solid #EAECF0;border-radius:14px;overflow:hidden;">'
-		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="height:4px;background:' . $m['accent'] . ';font-size:0;line-height:0;">&nbsp;</td></tr>'
-		. '<tr><td style="padding:28px 32px 8px;">'
-		. '<span style="' . $font . 'display:inline-block;padding:4px 10px;border-radius:999px;background:' . $m['tint'] . ';color:' . $m['accent'] . ';font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">' . $e( $m['badge'] ) . '</span>'
-		. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#101828;">' . $e( $m['title'] ) . '</h1>'
-		. '<p style="' . $font . 'margin:0;font-size:15px;line-height:1.55;color:#344054;">' . $e( $m['lead'] ) . '</p>'
-		. ( $rows ? '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;">' . $rows . '</table>' : '' )
-		. $button
-		. '</td></tr>'
-
-		// All sites
-		. '<tr><td style="padding:20px 32px 24px;">'
-		. '<div style="' . $font . 'font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#98A2B3;padding-bottom:4px;border-bottom:1px solid #EAECF0;">All sites</div>'
-		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' . $sites . '</table>'
-		. '</td></tr></table></td></tr>'
-
-		// Footer
-		. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">'
-		. 'Checked every 5 minutes. You hear from the watcher only when something changes.'
-		. '</td></tr></table></td></tr></table></body></html>';
-}
 
 function close_incident( &$incidents, $url, $now ) {
 	foreach ( $incidents as &$i ) {
@@ -336,24 +277,19 @@ function summary( $conf, $state, $now ) {
 	];
 }
 
-/** Plain text + HTML in one message; the subject is encoded so accents (Défi, Métalus) survive. */
-function send( $conf, $subject, $text, $html ) {
-	$from     = $conf['from'] ?? 'watcher@' . gethostname();
-	$boundary = 'msu-' . bin2hex( random_bytes( 12 ) );
-	$part     = function ( $type, $content ) use ( $boundary ) {
-		return "--$boundary\r\nContent-Type: $type; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" . chunk_split( base64_encode( $content ) );
-	};
-	$headers = "From: Safe updates watcher <$from>\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"$boundary\"";
-	$body    = $part( 'text/plain', $text ) . $part( 'text/html', $html ) . "--$boundary--\r\n";
-	return mail( $conf['email'], '=?UTF-8?B?' . base64_encode( $subject ) . '?=', $body, $headers, "-f$from" );
-}
-
-function duration( $s ) {
-	return $s < 3600 ? max( 1, round( $s / 60 ) ) . ' min' : ( $s < 172800 ? round( $s / 3600, 1 ) . ' h' : round( $s / 86400, 1 ) . ' days' );
-}
-
-/** Write to a temp file then rename, so readers never see half a file. */
-function save( $path, $data ) {
-	file_put_contents( "$path.tmp", json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) );
-	rename( "$path.tmp", $path );
+/** For the dashboard's daily routine: every watched site, with its report link once it has signed up. */
+function sites_list( $conf, $now ) {
+	$reg   = registry();
+	$sites = [];
+	foreach ( $conf['sites'] as $s ) {
+		$r       = $reg[ site_key( $s['url'] ) ] ?? [];
+		$sites[] = [
+			'name'       => $s['name'],
+			'url'        => $s['url'],
+			'report_url' => $r['report_url'] ?? null,
+			'version'    => $r['version'] ?? null,
+			'last_seen'  => isset( $r['last_seen'] ) ? gmdate( 'c', $r['last_seen'] ) : null,
+		];
+	}
+	return [ 'generated' => gmdate( 'c', $now ), 'sites' => $sites ];
 }
