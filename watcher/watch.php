@@ -176,7 +176,7 @@ function alert_parts( $conf, $kind, $site, $res, $all ) {
 		'still'   => [ 'Still down', 'Still down: ',  "$name is still down",        '#C4320A', '#FEF3EE' ],
 		'problem' => [ 'Problem',    'Problem: ',     "$name has a problem",        '#B54708', '#FFF8EB' ],
 		'back'    => [ 'Back up',    '',              "$name is back",              '#067647', '#ECFDF3' ],
-		'test'    => [ 'Test',       '',              'Alerts reach you',           '#1F4FD8', '#EEF3FF' ],
+		'test'    => [ 'Test',       '',              'Alerts reach you',           '#15151C', '#EEEDE8' ],
 	][ $kind ];
 	list( $badge, $prefix, $title, $accent, $tint ) = $look;
 

@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: EgoWebDesign – Safe updates
- * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Watches for signs of intrusion: new administrators, changed core files, unexpected PHP files. Also publishes a private update report (WordPress, theme and plugin versions) for the EgoWebDesign monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
+ * Plugin Name: Safe updates
+ * Description: Runs WordPress, plugin and theme updates automatically, right after saving a snapshot of the database. Holds big releases for 7 days, checks the key pages after each update, and puts back the previous version of a plugin or theme that breaks the site (the database snapshot can be put back from the Dashboard). Watches for signs of intrusion: new administrators, changed core files, unexpected PHP files. Also publishes a private update report (WordPress, theme and plugin versions) for the A2 Studio monitoring dashboard. Updates itself from GitHub. Settings: Settings > Safe updates.
  * Version: 2.7.0
- * Author: EgoWebDesign
+ * Author: A2 Studio
  * Requires PHP: 7.4
  * Update URI: https://github.com/choikib/egowebdesign-safe-updates
  */
@@ -68,8 +68,8 @@ final class EgoWebDesign_Safe_Updates {
 	}
 
 	/**
-	 * Signs this site up with the EgoWebDesign watcher, or refreshes its details there (name, report link, version).
-	 * The watcher checks the report link really answers for this site; a new site is monitored once EgoWebDesign approves it.
+	 * Signs this site up with the A2 Studio watcher, or refreshes its details there (name, report link, version).
+	 * The watcher checks the report link really answers for this site; a new site is monitored once A2 Studio approves it.
 	 */
 	public static function register_site() {
 		if ( empty( self::settings()['register'] ) ) {
@@ -96,9 +96,9 @@ final class EgoWebDesign_Safe_Updates {
 
 	private static function registry_label( $status ) {
 		return [
-			'approved' => 'monitored by EgoWebDesign',
-			'pending'  => 'waiting for EgoWebDesign to approve it',
-			'ignored'  => 'declined by EgoWebDesign, not monitored',
+			'approved' => 'monitored by A2 Studio',
+			'pending'  => 'waiting for A2 Studio to approve it',
+			'ignored'  => 'declined by A2 Studio, not monitored',
 		][ $status ] ?? "could not sign up ($status)";
 	}
 
@@ -226,6 +226,11 @@ final class EgoWebDesign_Safe_Updates {
 			'version' => $version,
 			'url'     => 'https://github.com/' . self::REPO,
 			'package' => 'https://github.com/' . self::REPO . "/archive/refs/tags/v$version.zip",
+			'icons'   => [
+				'svg' => plugins_url( 'assets/a2-icon.svg', __FILE__ ),
+				'1x'  => plugins_url( 'assets/a2-icon-128.png', __FILE__ ),
+				'2x'  => plugins_url( 'assets/a2-icon-256.png', __FILE__ ),
+			],
 		];
 	}
 
@@ -1628,6 +1633,16 @@ final class EgoWebDesign_Safe_Updates {
 		echo '</tbody></table>';
 	}
 
+	/** A2 Studio artwork from its logo kit (never retyped): the app icon, or the horizontal "A² studio" logo. */
+	private static function brand_svg( $which, $class ) {
+		$a      = '<path fill="%s" fill-rule="evenodd" d="M86 34 L134 34 L202 218 L155.09 218 L144 188 L76 188 L64.91 218 L18 218 Z M110 96 L132.91 158 H87.09 Z"/><rect fill="#FF5A36" x="190" y="34" width="46" height="46"/>';
+		$studio = '<g fill="#15151C" transform="translate(276 218) scale(0.82)"><path fill-rule="evenodd" d="M85.84 -103.5 A46 37 0 1 0 46 -48 A22 13 0 1 1 26.95 -28.5 L6.16 -16.5 A46 37 0 1 0 46 -72 A22 13 0 1 1 65.05 -91.5 Z"/><path d="M126 -160 H152 V0 H126 Z"/><path d="M112 -120 H180 V-96 H112 Z"/><path fill-rule="evenodd" d="M196 -120 H222 V-56 A30 30 0 0 0 282 -56 V-120 H308 V0 H282 V-12 A56 56 0 0 1 196 -56 Z"/><path fill-rule="evenodd" d="M330 -60 A62 62 0 1 0 454 -60 A62 62 0 1 0 330 -60 Z M356 -60 A36 36 0 1 1 428 -60 A36 36 0 1 1 356 -60 Z"/><path d="M428 -172 H454 V0 H428 Z"/><path d="M480 -120 H506 V0 H480 Z"/><path d="M480 -172 H506 V-146 H480 Z"/><path fill-rule="evenodd" d="M528 -60 A62 62 0 1 0 652 -60 A62 62 0 1 0 528 -60 Z M554 -60 A36 36 0 1 1 626 -60 A36 36 0 1 1 554 -60 Z"/></g>';
+		if ( 'icon' === $which ) {
+			return '<svg class="' . esc_attr( $class ) . '" width="20" height="20" viewBox="0 0 256 256" aria-hidden="true"><rect width="256" height="256" rx="56" fill="#15151C"/><g transform="translate(38.4 40) scale(0.7)"><path fill="#FFFFFF" fill-rule="evenodd" d="M86 34 L134 34 L202 218 L155.09 218 L146.22 194 L73.78 194 L64.91 218 L18 218 Z M110 96 L135.13 164 H84.87 Z"/><rect fill="#FF5A36" x="180" y="34" width="56" height="56"/></g></svg>';
+		}
+		return '<svg class="' . esc_attr( $class ) . '" width="100" height="31" viewBox="0 0 828 256" role="img" aria-label="A2 Studio"><title>A2 Studio</title>' . sprintf( $a, '#15151C' ) . $studio . '</svg>';
+	}
+
 	/** Styles and behaviour for the dashboard box and the settings screen, printed once. */
 	private static function assets() {
 		static $done = false;
@@ -1680,7 +1695,19 @@ final class EgoWebDesign_Safe_Updates {
 .msu-field{display:flex;gap:8px;align-items:center}
 .msu-field input{flex:1;min-width:0}
 .msu-form-actions{display:flex;gap:8px;margin-top:10px}
-@media (max-width:600px){.msu-sub{display:none}.msu-rows{grid-template-columns:1fr;gap:2px}.msu-rows dd{margin-bottom:8px}}
+.msu-brand{display:flex;align-items:center;gap:14px;margin:12px 0 18px;padding:16px 20px;background:#fff;border:1px solid #e4e3de;border-radius:10px}
+.msu-brand .msu-icon{flex:none;width:44px;height:44px}
+.msu-brand h1{margin:0;padding:0;font-size:22px;line-height:1.2;font-weight:700;color:#15151C}
+.msu-brand p{margin:2px 0 0;color:#55555f}
+.msu-by{display:flex;align-items:center;gap:8px;margin-left:auto;color:#55555f;font-size:12px;text-decoration:none}
+.msu-by .msu-logo{width:100px;height:31px}
+.msu-wrap .nav-tab-active,.msu-wrap .nav-tab-active:hover{box-shadow:inset 0 3px 0 #FF5A36}
+.msu-wrap .button-primary{background:#15151C;border-color:#15151C;color:#fff}
+.msu-wrap .button-primary:hover,.msu-wrap .button-primary:focus{background:#2c2c36;border-color:#2c2c36;color:#fff}
+.msu-wrap .button-primary:focus{box-shadow:0 0 0 1px #fff,0 0 0 3px #FF5A36}
+.msu-widget-title{display:inline-flex;align-items:center;gap:8px}
+.msu-widget-title .msu-icon{width:20px;height:20px}
+@media (max-width:600px){.msu-by span{display:none}.msu-sub{display:none}.msu-rows{grid-template-columns:1fr;gap:2px}.msu-rows dd{margin-bottom:8px}}
 </style>
 <script>
 document.addEventListener('submit', function (e) {
@@ -1724,7 +1751,7 @@ document.addEventListener('click', function (e) {
 
 	public static function dashboard_widget() {
 		if ( current_user_can( 'update_plugins' ) ) {
-			wp_add_dashboard_widget( 'msu_widget', 'Safe updates', [ __CLASS__, 'render_widget' ] );
+			wp_add_dashboard_widget( 'msu_widget', '<span class="msu-widget-title">' . self::brand_svg( 'icon', 'msu-icon' ) . 'Safe updates</span>', [ __CLASS__, 'render_widget' ] );
 		}
 	}
 
@@ -1773,7 +1800,9 @@ document.addEventListener('click', function (e) {
 		$tab  = isset( $tabs[ $tab ] ) ? $tab : 'overview';
 		self::assets();
 
-		echo '<div class="wrap msu-wrap"><h1>Safe updates <span class="msu-version">v' . esc_html( self::VERSION ) . '</span></h1>';
+		echo '<div class="wrap msu-wrap"><div class="msu-brand">' . self::brand_svg( 'icon', 'msu-icon' )
+			. '<div><h1>Safe updates <span class="msu-version">v' . esc_html( self::VERSION ) . '</span></h1><p>Updates, backups and security for this site</p></div>'
+			. '<div class="msu-by"><span>by</span>' . self::brand_svg( 'logo', 'msu-logo' ) . '</div></div><hr class="wp-header-end">';
 		echo '<nav class="nav-tab-wrapper">';
 		foreach ( $tabs as $id => $label ) {
 			echo '<a href="' . esc_url( self::page_url( 'overview' === $id ? '' : $id ) ) . '" class="nav-tab' . ( $id === $tab ? ' nav-tab-active' : '' ) . '"' . ( $id === $tab ? ' aria-current="page"' : '' ) . '>' . esc_html( $label ) . '</a>';
@@ -1903,7 +1932,7 @@ document.addEventListener('click', function (e) {
 		echo '</table></div>';
 
 		$reg = get_option( 'msu_registry', [] );
-		echo '<div class="card"><h2>EgoWebDesign monitoring</h2><p class="description">Once a day, this site sends its name, address and private report link to egowebdesign.ca, so EgoWebDesign can watch it every 5 minutes and show it on the monitoring dashboard. A new site is monitored only once EgoWebDesign approves it.</p>';
+		echo '<div class="card"><h2>A2 Studio monitoring</h2><p class="description">Once a day, this site sends its name, address and private report link to the A2 Studio watcher, so A2 Studio can watch it every 5 minutes and show it on the monitoring dashboard. A new site is monitored only once A2 Studio approves it.</p>';
 		echo '<p><label><input type="checkbox" name="register" value="1"' . checked( ! empty( $s['register'] ), true, false ) . '> Sign up this site for monitoring</label></p>';
 		if ( ! empty( $reg['time'] ) ) {
 			echo '<p class="msu-muted">' . esc_html( ucfirst( self::registry_label( $reg['status'] ) ) ) . ' · last contact ' . self::ago( $reg['time'] ) . '</p>';
@@ -1916,13 +1945,13 @@ document.addEventListener('click', function (e) {
 	}
 
 	public static function render_tab_monitoring() {
-		echo '<div class="card"><h2>Update report link</h2><p class="description">For the EgoWebDesign monitoring dashboard. Anyone with this link can see the WordPress, theme and plugin versions of this site, nothing else, and it changes nothing.</p>';
+		echo '<div class="card"><h2>Update report link</h2><p class="description">For the A2 Studio monitoring dashboard. Anyone with this link can see the WordPress, theme and plugin versions of this site, nothing else, and it changes nothing.</p>';
 		echo '<div class="msu-field"><input id="msu-report" type="text" readonly class="code" value="' . esc_attr( self::report_url() ) . '"><button type="button" class="button" data-msu-copy="msu-report">Copy</button></div>';
 		echo '<div class="msu-actions">';
 		self::action_button( 'msu_new_key', 'Make a new link', [], 'button-link button-link-delete', 'The current link will stop working right away. Continue?' );
 		echo '<span class="msu-muted">Use this if the link was shared by mistake.</span></div></div>';
 
-		echo '<div class="card"><h2>Status link</h2><p class="description">For the EgoWebDesign watcher, which checks it every 5 minutes and emails when the site goes down or comes back. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running. The site signs up for this on its own (Settings tab).</p>';
+		echo '<div class="card"><h2>Status link</h2><p class="description">For the A2 Studio watcher, which checks it every 5 minutes and emails when the site goes down or comes back. Answers <code>200</code> while the page checks pass and <code>503</code> when they fail or stop running. The site signs up for this on its own (Settings tab).</p>';
 		echo '<div class="msu-field"><input id="msu-status" type="text" readonly class="code" value="' . esc_attr( rest_url( 'egowebdesign/v1/status' ) ) . '"><button type="button" class="button" data-msu-copy="msu-status">Copy</button></div></div>';
 	}
 
@@ -2142,7 +2171,7 @@ document.addEventListener('click', function (e) {
 			'red'   => [ '#C4320A', '#FEF3EE' ],
 			'amber' => [ '#B54708', '#FFF8EB' ],
 			'green' => [ '#067647', '#ECFDF3' ],
-			'blue'  => [ '#1F4FD8', '#EEF3FF' ],
+			'blue'  => [ '#15151C', '#EEEDE8' ], // A2 Studio ink: news, nothing wrong.
 		][ $m['tone'] ?? 'red' ];
 		$text  = "{$m['title']}\n\n{$m['lead']}\n";
 		$body  = '';
@@ -2153,8 +2182,8 @@ document.addEventListener('click', function (e) {
 			$body .= '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;">';
 			$text .= "\n";
 			foreach ( $m['facts'] as $f ) {
-				$body .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#667085;font-size:13px;width:130px;vertical-align:top;">' . $e( $f[0] ) . '</td>'
-					. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;color:#101828;font-size:14px;vertical-align:top;">' . $e( $f[1] ) . '</td></tr>';
+				$body .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #E4E3DE;color:#667085;font-size:13px;width:130px;vertical-align:top;">' . $e( $f[0] ) . '</td>'
+					. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #E4E3DE;color:#15151C;font-size:14px;vertical-align:top;">' . $e( $f[1] ) . '</td></tr>';
 				$text .= "{$f[0]}: {$f[1]}\n";
 			}
 			$body .= '</table>';
@@ -2173,7 +2202,7 @@ document.addEventListener('click', function (e) {
 			$text .= "\n" . ( $heading ? "$heading:\n" : '' );
 			foreach ( $items as $i ) {
 				$detail = '' === (string) ( $i[1] ?? '' ) ? '' : '<div style="' . ( $mono ? 'font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;word-break:break-all;' : $font . 'font-size:13px;' ) . 'line-height:1.5;color:#475467;padding-top:2px;">' . $e( $i[1] ) . '</div>';
-				$body  .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #EAECF0;vertical-align:top;"><div style="font-size:14px;font-weight:600;color:#101828;">' . $e( $i[0] ) . '</div>' . $detail . '</td></tr>';
+				$body  .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #E4E3DE;vertical-align:top;"><div style="font-size:14px;font-weight:600;color:#15151C;">' . $e( $i[0] ) . '</div>' . $detail . '</td></tr>';
 				$text  .= "- {$i[0]}" . ( '' === (string) ( $i[1] ?? '' ) ? '' : ": {$i[1]}" ) . "\n";
 			}
 			$body .= '</table>';
@@ -2191,21 +2220,22 @@ document.addEventListener('click', function (e) {
 			$text .= "\n{$m['button'][0]}: {$m['button'][1]}\n";
 		}
 		$footer = $m['footer'] ?? 'Safe updates watches this site\'s updates, pages and security.';
+		$icon   = plugins_url( 'assets/a2-icon-72.png', __FILE__ );
 
 		$html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><title>' . $e( $m['title'] ) . '</title></head>'
-			. '<body style="margin:0;padding:0;background:#F2F4F7;"><div style="display:none;max-height:0;overflow:hidden;">' . $e( $m['lead'] ) . '</div>'
-			. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F4F7;"><tr><td align="center" style="padding:32px 16px;">'
+			. '<body style="margin:0;padding:0;background:#F6F5F1;"><div style="display:none;max-height:0;overflow:hidden;">' . $e( $m['lead'] ) . '</div>'
+			. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F5F1;"><tr><td align="center" style="padding:32px 16px;">'
 			. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">'
-			. '<tr><td style="' . $font . 'padding:0 4px 14px;font-size:13px;color:#475467;"><span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;border-radius:6px;background:#101828;color:#FFFFFF;font-size:12px;font-weight:700;vertical-align:middle;margin-right:8px;">S</span>'
-			. '<span style="vertical-align:middle;font-weight:600;color:#101828;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; ' . $e( $site ) . '</span></td></tr>'
-			. '<tr><td style="background:#FFFFFF;border:1px solid #EAECF0;border-radius:14px;overflow:hidden;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+			. '<tr><td style="' . $font . 'padding:0 4px 14px;font-size:13px;color:#475467;"><img src="' . esc_url( $icon ) . '" width="24" height="24" alt="A2 Studio" style="display:inline-block;width:24px;height:24px;border:0;vertical-align:middle;margin-right:8px;">'
+			. '<span style="vertical-align:middle;font-weight:700;color:#15151C;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; ' . $e( $site ) . '</span></td></tr>'
+			. '<tr><td style="background:#FFFFFF;border:1px solid #E4E3DE;border-radius:14px;overflow:hidden;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
 			. '<tr><td style="height:4px;background:' . $accent . ';font-size:0;line-height:0;">&nbsp;</td></tr><tr><td style="padding:28px 32px 28px;">'
 			. '<span style="' . $font . 'display:inline-block;padding:4px 10px;border-radius:999px;background:' . $tint . ';color:' . $accent . ';font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">' . $e( $m['badge'] ) . '</span>'
-			. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#101828;">' . $e( $m['title'] ) . '</h1>'
+			. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#15151C;">' . $e( $m['title'] ) . '</h1>'
 			. '<p style="' . $font . 'margin:0;font-size:15px;line-height:1.55;color:#344054;">' . $e( $m['lead'] ) . '</p>'
 			. $body
 			. '</td></tr></table></td></tr>'
-			. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">' . $e( home_url( '/' ) ) . ' · ' . $e( $footer ) . '</td></tr>'
+			. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">' . $e( home_url( '/' ) ) . ' · ' . $e( $footer ) . '<br>Safe updates by <span style="color:#55555F;font-weight:600;">A2 Studio</span></td></tr>'
 			. '</table></td></tr></table></body></html>';
 
 		return [ $html, $text, $site ];
