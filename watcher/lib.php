@@ -147,8 +147,8 @@ function approval_mail( $conf, $site ) {
 		'badge'  => 'New site',
 		'title'  => "{$site['name']} wants to be monitored",
 		'lead'   => "A site running Safe updates asked to join your monitoring. Add it to watch it every 5 minutes and show it on your dashboard. If you don't know this site, ignore it: it won't ask again.",
-		'accent' => '#15151C',
-		'tint'   => '#EEEDE8',
+		'accent' => '#3A3AFF',
+		'tint'   => '#DEDEFF',
 		'rows'   => [ [ 'Site', $site['url'] ], [ 'Safe updates', $site['version'] ], [ 'Asked', when( time() ) ] ],
 		'button' => [ 'Review and add', $link ],
 		'footer' => 'Nothing changes until you choose on that page.',
@@ -180,13 +180,13 @@ function email_html( $conf, $m, $all ) {
 	$e    = function ( $s ) { return htmlspecialchars( (string) $s, ENT_QUOTES, 'UTF-8' ); };
 	$font = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
 	$dot  = [ 'ok' => '#12B76A', 'problem' => '#F79009', 'down' => '#F04438' ];
-	$icon = dirname( $conf['approve_url'] ?? 'https://example.com/x' ) . '/a2-icon-72.png'; // A2 Studio icon, served next to approve.php.
+	$icon = dirname( $conf['approve_url'] ?? 'https://example.com/x' ) . '/a2-icon-72.png?v=2'; // A2 Studio icon, served next to approve.php (bump v when it changes: mail apps cache it).
 
 	$rows = '';
 	foreach ( $m['rows'] as $r ) {
-		$value = preg_match( '#^https?://#', $r[1] ) ? '<a href="' . $e( $r[1] ) . '" style="color:#15151C;text-decoration:underline;">' . $e( preg_replace( '#^https?://#', '', $r[1] ) ) . '</a>' : $e( $r[1] );
-		$rows .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #E4E3DE;color:#667085;font-size:13px;width:120px;vertical-align:top;">' . $e( $r[0] ) . '</td>'
-			. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #E4E3DE;color:#15151C;font-size:14px;vertical-align:top;">' . $value . '</td></tr>';
+		$value = preg_match( '#^https?://#', $r[1] ) ? '<a href="' . $e( $r[1] ) . '" style="color:#3A3AFF;text-decoration:none;">' . $e( preg_replace( '#^https?://#', '', $r[1] ) ) . '</a>' : $e( $r[1] );
+		$rows .= '<tr><td style="' . $font . 'padding:10px 0;border-top:1px solid #E2E2EC;color:#667085;font-size:13px;width:120px;vertical-align:top;">' . $e( $r[0] ) . '</td>'
+			. '<td style="' . $font . 'padding:10px 0;border-top:1px solid #E2E2EC;color:#101013;font-size:14px;vertical-align:top;">' . $value . '</td></tr>';
 	}
 
 	$button = '';
@@ -199,32 +199,32 @@ function email_html( $conf, $m, $all ) {
 	if ( null !== $all ) {
 		foreach ( $conf['sites'] as $s ) {
 			$st     = $all[ $s['url'] ]['state'] ?? null;
-			$sites .= '<tr><td style="' . $font . 'padding:8px 0;font-size:14px;color:#15151C;">'
+			$sites .= '<tr><td style="' . $font . 'padding:8px 0;font-size:14px;color:#101013;">'
 				. '<span style="display:inline-block;width:8px;height:8px;border-radius:4px;background:' . ( $dot[ $st ] ?? '#98A2B3' ) . ';margin-right:10px;vertical-align:middle;"></span>' . $e( $s['name'] ) . '</td>'
 				. '<td align="right" style="' . $font . 'padding:8px 0;font-size:13px;color:' . ( 'ok' === $st ? '#667085' : ( $dot[ $st ] ?? '#98A2B3' ) ) . ';font-weight:' . ( 'ok' === $st ? '400' : '600' ) . ';">' . $e( state_label( $st ) ) . '</td></tr>';
 		}
 		$sites = '<tr><td style="padding:20px 32px 24px;">'
-			. '<div style="' . $font . 'font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#98A2B3;padding-bottom:4px;border-bottom:1px solid #E4E3DE;">All sites</div>'
+			. '<div style="' . $font . 'font-size:12px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#98A2B3;padding-bottom:4px;border-bottom:1px solid #E2E2EC;">All sites</div>'
 			. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0">' . $sites . '</table></td></tr>';
 	}
 
 	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light"><meta name="supported-color-schemes" content="light"><title>' . $e( $m['title'] ) . '</title></head>'
-		. '<body style="margin:0;padding:0;background:#F6F5F1;">'
+		. '<body style="margin:0;padding:0;background:#F2F2F7;">'
 		. '<div style="display:none;max-height:0;overflow:hidden;">' . $e( $m['lead'] ) . '</div>'
-		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F6F5F1;"><tr><td align="center" style="padding:32px 16px;">'
+		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F2F2F7;"><tr><td align="center" style="padding:32px 16px;">'
 		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;">'
 
 		// Brand line
 		. '<tr><td style="' . $font . 'padding:0 4px 14px;font-size:13px;color:#475467;">'
 		. '<img src="' . $e( $icon ) . '" width="24" height="24" alt="A2 Studio" style="display:inline-block;width:24px;height:24px;border:0;vertical-align:middle;margin-right:8px;">'
-		. '<span style="vertical-align:middle;font-weight:700;color:#15151C;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; Watcher</span></td></tr>'
+		. '<span style="vertical-align:middle;font-weight:700;color:#101013;">Safe updates</span><span style="vertical-align:middle;"> &nbsp;·&nbsp; Watcher</span></td></tr>'
 
 		// Card
-		. '<tr><td style="background:#FFFFFF;border:1px solid #E4E3DE;border-radius:14px;overflow:hidden;">'
+		. '<tr><td style="background:#FFFFFF;border:1px solid #E2E2EC;border-radius:14px;overflow:hidden;">'
 		. '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr><td style="height:4px;background:' . $m['accent'] . ';font-size:0;line-height:0;">&nbsp;</td></tr>'
 		. '<tr><td style="padding:28px 32px ' . ( $sites ? '8px' : '28px' ) . ';">'
 		. '<span style="' . $font . 'display:inline-block;padding:4px 10px;border-radius:999px;background:' . $m['tint'] . ';color:' . $m['accent'] . ';font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;">' . $e( $m['badge'] ) . '</span>'
-		. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#15151C;">' . $e( $m['title'] ) . '</h1>'
+		. '<h1 style="' . $font . 'margin:14px 0 8px;font-size:24px;line-height:1.25;font-weight:700;color:#101013;">' . $e( $m['title'] ) . '</h1>'
 		. '<p style="' . $font . 'margin:0;font-size:15px;line-height:1.55;color:#344054;">' . $e( $m['lead'] ) . '</p>'
 		. ( $rows ? '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-top:20px;">' . $rows . '</table>' : '' )
 		. $button
@@ -235,7 +235,7 @@ function email_html( $conf, $m, $all ) {
 		// Footer
 		. '<tr><td style="' . $font . 'padding:16px 8px 0;font-size:12px;line-height:1.5;color:#98A2B3;text-align:center;">'
 		. $e( $m['footer'] ?? 'Checked every 5 minutes. You hear from the watcher only when something changes.' )
-		. '<br>Safe updates by <span style="color:#55555F;font-weight:600;">A2 Studio</span>'
+		. '<br>Safe updates by <span style="color:#5B5B6B;font-weight:600;">A2 Studio</span>'
 		. '</td></tr></table></td></tr></table></body></html>';
 }
 
